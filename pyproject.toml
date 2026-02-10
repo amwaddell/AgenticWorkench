@@ -1,0 +1,35 @@
+[project]
+name = "agentic-workbench"
+version = "0.0.0"
+requires-python = ">=3.11"
+description = "Agentic Workbench"
+readme = "README.md"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+src = ["src", "tests", "scripts"]
+exclude = [
+  ".venv",
+  "__pycache__",
+  ".git",
+  ".mypy_cache",
+  ".ruff_cache",
+  "build",
+  "dist",
+]
+
+[tool.ruff.lint]
+# A good starter set: pyflakes/pycodestyle, import sorting, and common bugbears
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"] # formatter handles line length
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"

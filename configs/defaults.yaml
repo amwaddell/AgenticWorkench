@@ -1,0 +1,61 @@
+# Default configuration for agentic workbench
+
+# Model server settings
+model:
+  provider: "llamacpp_server"
+  base_url: "http://localhost:8080"
+  model_name: "ministral-8b"
+  temperature: 0.7
+  max_tokens: 2048
+  timeout_seconds: 60
+
+# Embedding settings
+embeddings:
+  provider: "sentence_transformers"
+  model_name: "all-MiniLM-L6-v2"
+  batch_size: 32
+  device: "cpu"
+
+# Retrieval settings
+retrieval:
+  strategy: "hybrid"
+  top_k: 20
+  keyword_weight: 0.3
+  vector_weight: 0.7
+
+# Reranking settings
+reranking:
+  enabled: true
+  provider: "cross_encoder"
+  model_name: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  top_n: 5
+
+# Chunking settings
+chunking:
+  strategy: "heading_aware"
+  max_chunk_tokens: 512
+  overlap_tokens: 50
+  min_chunk_tokens: 100
+
+# Data paths
+paths:
+  data_dir: "./data"
+  raw_data: "./data/raw"
+  processed_data: "./data/processed"
+  indexes_dir: "./data/indexes"
+  active_index: "./data/indexes/active"
+  index_snapshots: "./data/indexes/snapshots"
+
+# Run settings
+runs:
+  output_dir: "./runs"
+  logs_dir: "./runs/logs"
+  traces_dir: "./runs/traces"
+  reports_dir: "./runs/reports"
+
+# Observability
+observability:
+  enable_tracing: true
+  enable_metrics: true
+  phoenix_endpoint: "http://localhost:6006"
+  log_level: "INFO"
