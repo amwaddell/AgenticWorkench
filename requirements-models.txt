@@ -1,0 +1,7 @@
+# Model server dependencies
+# 
+# Install with Metal acceleration on macOS:
+# pip install "llama-cpp-python[server]" --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/metal
+#
+# Or without acceleration (slower):
+# pip install "llama-cpp-python[server]"

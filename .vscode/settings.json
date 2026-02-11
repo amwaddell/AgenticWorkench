@@ -1,0 +1,19 @@
+{
+  // Use the venv in this repo
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+
+  // Formatting: Ruff
+  "editor.defaultFormatter": "charliermarsh.ruff",
+  "editor.formatOnSave": true,
+
+  // Also run Ruff fixes/import sorting on save (optional but handy)
+  "editor.codeActionsOnSave": {
+    "source.fixAll.ruff": "explicit",
+    "source.organizeImports.ruff": "explicit"
+  },
+
+  // Testing: pytest
+  "python.testing.pytestEnabled": true,
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestArgs": ["tests"]
+}
