@@ -1,70 +1,53 @@
+# ============================================================================
 # Agentic Workbench .gitignore
+# ============================================================================
 
-# ============================================================================
-# Model Files (VERY LARGE - do not commit)
-# ============================================================================
+# ----------------------------------------------------------------------------
+# LARGE MODEL FILES (DO NOT COMMIT) - These are 4-5GB+ each!
+# ----------------------------------------------------------------------------
 *.gguf
 *.bin
 *.safetensors
 *.pt
 *.pth
+*.ckpt
+
+# Model directories
 data/models/
-!data/models/.gitkeep
+models/
+checkpoints/
 
-# ============================================================================
-# Data Files (potentially large)
-# ============================================================================
-# Raw data dumps
+# ----------------------------------------------------------------------------
+# DATA DIRECTORIES (DO NOT COMMIT) - Can be large and regenerated
+# ----------------------------------------------------------------------------
 data/raw/
-!data/raw/.gitkeep
-
-# Processed data
-data/processed/*.parquet
-data/processed/*.csv
-data/processed/*.json
-data/processed/*.jsonl
-!data/processed/.gitkeep
-
-# Indexes (can be rebuilt)
+data/processed/
 data/indexes/
-!data/indexes/.gitkeep
-
-# ============================================================================
-# Run Outputs (generated files)
-# ============================================================================
-# Run logs
-runs/logs/*.jsonl
-runs/logs/**/*.jsonl
-
-# Traces
-runs/traces/
-!runs/traces/.gitkeep
-
-# Reports
-runs/reports/*.html
-runs/reports/*.md
-runs/reports/**/*
-!runs/reports/.gitkeep
-
-# Metrics database
-runs/metrics/*.sqlite
-runs/metrics/*.db
-!runs/metrics/.gitkeep
+data/embeddings/
 
 # Keep directory structure but ignore contents
-runs/**/
-!runs/**/.gitkeep
+!data/.gitkeep
+!data/models/.gitkeep
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/indexes/.gitkeep
 
-# ============================================================================
-# Phoenix / Observability
-# ============================================================================
-# Phoenix database
-phoenix.db
-.phoenix/
+# ----------------------------------------------------------------------------
+# RUN OUTPUTS (DO NOT COMMIT) - Generated per run
+# ----------------------------------------------------------------------------
+runs/
+*.log
+*.jsonl
 
-# ============================================================================
-# Python
-# ============================================================================
+# Metrics database
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+
+# ----------------------------------------------------------------------------
+# PYTHON
+# ----------------------------------------------------------------------------
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -87,6 +70,7 @@ parts/
 sdist/
 var/
 wheels/
+pip-wheel-metadata/
 share/python-wheels/
 *.egg-info/
 .installed.cfg
@@ -96,10 +80,6 @@ MANIFEST
 # PyInstaller
 *.manifest
 *.spec
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
 
 # Unit test / coverage reports
 htmlcov/
@@ -114,106 +94,31 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
-cover/
 
-# Translations
-*.mo
-*.pot
-
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
-
-# Flask stuff:
-instance/
-.webassets-cache
-
-# Scrapy stuff:
-.scrapy
-
-# Sphinx documentation
-docs/_build/
-
-# PyBuilder
-.pybuilder/
-target/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-*/.ipynb_checkpoints/*
-
-# IPython
-profile_default/
-ipython_config.py
-
-# pyenv
-.python-version
-
-# pipenv
-Pipfile.lock
-
-# poetry
-poetry.lock
-
-# pdm
-.pdm.toml
-
-# PEP 582
-__pypackages__/
-
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath parsed files
-*.sage.py
-
-# Environments
-.env
-.venv
-env/
+# ----------------------------------------------------------------------------
+# VIRTUAL ENVIRONMENTS
+# ----------------------------------------------------------------------------
+.venv/
 venv/
 ENV/
-env.bak/
-venv.bak/
+env/
+.virtualenv/
 
-# Spyder project settings
-.spyderproject
-.spyproject
+# ----------------------------------------------------------------------------
+# JUPYTER NOTEBOOK
+# ----------------------------------------------------------------------------
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
 
-# Rope project settings
-.ropeproject
+# Jupyter Notebook config
+.jupyter/
 
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
-# pytype static type analyzer
-.pytype/
-
-# Cython debug symbols
-cython_debug/
-
-# ============================================================================
-# IDEs
-# ============================================================================
+# ----------------------------------------------------------------------------
+# IDEs & EDITORS
+# ----------------------------------------------------------------------------
 # VSCode
-.vscode/*
-!.vscode/settings.json
-!.vscode/launch.json
-!.vscode/extensions.json
-!.vscode/*.code-snippets
-.history/
-*.vsix
+.vscode/
+*.code-workspace
 
 # PyCharm
 .idea/
@@ -226,37 +131,23 @@ cython_debug/
 *.sublime-workspace
 
 # Vim
-*~
 *.swp
 *.swo
-.*.sw?
+*~
 
 # Emacs
 *~
 \#*\#
 .\#*
 
-# ============================================================================
-# Operating Systems
-# ============================================================================
+# ----------------------------------------------------------------------------
+# OPERATING SYSTEM
+# ----------------------------------------------------------------------------
 # macOS
 .DS_Store
 .AppleDouble
 .LSOverride
-Icon
 ._*
-.DocumentRevisions-V100
-.fseventsd
-.Spotlight-V100
-.TemporaryItems
-.Trashes
-.VolumeIcon.icns
-.com.apple.timemachine.donotpresent
-.AppleDB
-.AppleDesktop
-Network Trash Folder
-Temporary Items
-.apdisk
 
 # Windows
 Thumbs.db
@@ -266,62 +157,80 @@ ehthumbs_vista.db
 *.stackdump
 [Dd]esktop.ini
 $RECYCLE.BIN/
-*.cab
-*.msi
-*.msix
-*.msm
-*.msp
-*.lnk
 
 # Linux
-*~
 .directory
 .Trash-*
-.nfs*
 
-# ============================================================================
-# Project Specific
-# ============================================================================
-# Temporary files
-tmp/
-temp/
+# ----------------------------------------------------------------------------
+# OBSERVABILITY & MONITORING
+# ----------------------------------------------------------------------------
+# Phoenix
+.phoenix/
+
+# OpenTelemetry
+.otel/
+
+# ----------------------------------------------------------------------------
+# TEMPORARY FILES
+# ----------------------------------------------------------------------------
 *.tmp
-
-# Downloaded files (can be re-downloaded)
-downloads/
-
-# Backup files
+*.temp
 *.bak
-*.backup
-*~
+*.swp
+*.swo
+*.orig
 
-# Config overrides (keep defaults only)
-configs/*_local.yaml
-configs/*_override.yaml
-configs/secrets.yaml
+# ----------------------------------------------------------------------------
+# SECRETS & CREDENTIALS (IMPORTANT!)
+# ----------------------------------------------------------------------------
+*.key
+*.pem
+*.env
+.env.local
+.env.*.local
+secrets/
+credentials/
+*.secret
 
-# Experiment artifacts
-experiments/
-scratch/
+# ----------------------------------------------------------------------------
+# PROJECT SPECIFIC
+# ----------------------------------------------------------------------------
+# Downloaded datasets
+*.zip
+*.tar.gz
+*.tar.bz2
+*.7z
 
-# ============================================================================
-# Keep Directory Structure
-# ============================================================================
-# This ensures empty directories stay in git
-!.gitkeep
+# Large text dumps
+*.xml.bz2
+*.json.gz
 
-# ============================================================================
-# Notes
-# ============================================================================
-# Add personal notes here that shouldn't be committed
-NOTES.txt
-TODO.txt
-*_NOTES.md
+# Cached embeddings
+*.npy
+*.npz
+*.pkl
+*.pickle
 
-# ============================================================================
-# Specific Large Files (examples)
-# ============================================================================
-# Add specific large files or patterns here
-# Example: 
-# data/wikipedia_dump.xml
-# data/large_dataset.csv
+# Index files (can be large)
+*.faiss
+*.annoy
+
+# ----------------------------------------------------------------------------
+# KEEP THESE FILES (Override above patterns)
+# ----------------------------------------------------------------------------
+# Keep example small models for testing (if any)
+!tests/fixtures/*.gguf
+
+# Keep documentation
+!*.md
+!docs/
+
+# Keep config files
+!configs/
+!*.yaml
+!*.yml
+!*.toml
+
+# Keep example data (small files only)
+!examples/data/*.txt
