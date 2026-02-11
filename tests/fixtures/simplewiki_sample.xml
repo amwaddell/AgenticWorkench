@@ -1,0 +1,82 @@
+<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/" xml:lang="en">
+  <page>
+    <title>Anarchism</title>
+    <ns>0</ns>
+    <id>12</id>
+    <revision>
+      <id>101</id>
+      <text>'''Anarchism''' is a [[political philosophy]] and [[Political movement|movement]] that is against all forms of [[authority]].
+
+It seeks to abolish the institutions it claims maintain unnecessary [[coercion]] and [[hierarchy]], typically including the [[State (polity)|state]] and [[capitalism]].
+
+== History ==
+Anarchism has roots in the [[Age of Enlightenment]].
+
+== See also ==
+* [[Libertarianism]]
+
+[[Category:Political movements]]
+[[Category:Anarchism]]</text>
+    </revision>
+  </page>
+  <page>
+    <title>Autism</title>
+    <ns>0</ns>
+    <id>25</id>
+    <revision>
+      <id>102</id>
+      <text>'''Autism''' is a [[Neurodevelopmental disorder|neurodevelopmental disorder]] characterized by difficulties with [[social interaction]] and [[communication]].
+
+Parents often notice signs during the first three years of their child's life.&lt;ref&gt;Lord C, et al. (2018)&lt;/ref&gt;
+
+{{Infobox medical condition
+| name = Autism
+| field = Psychiatry
+}}
+
+Autism is associated with a combination of [[Genetics|genetic]] and [[Environment (biophysical)|environmental]] factors.</text>
+    </revision>
+  </page>
+  <page>
+    <title>Albedo</title>
+    <ns>0</ns>
+    <id>39</id>
+    <revision>
+      <id>103</id>
+      <text>'''Albedo''' is a measure of the [[Diffuse reflection|diffuse reflection]] of [[solar radiation]].
+
+The [[albedo]] of fresh [[snow]] is high (0.80–0.90) while the albedo of the [[ocean]] surface is low. The average albedo of [[Earth]] is about 0.30.
+
+== External links ==
+* [https://example.com/albedo Albedo explanation]</text>
+    </revision>
+  </page>
+  <page>
+    <title>Stub article</title>
+    <ns>0</ns>
+    <id>99</id>
+    <revision>
+      <id>104</id>
+      <text>short</text>
+    </revision>
+  </page>
+  <page>
+    <title>Redirect page</title>
+    <ns>0</ns>
+    <id>100</id>
+    <redirect title="Anarchism" />
+    <revision>
+      <id>105</id>
+      <text>#REDIRECT [[Anarchism]]</text>
+    </revision>
+  </page>
+  <page>
+    <title>Talk:Anarchism</title>
+    <ns>1</ns>
+    <id>200</id>
+    <revision>
+      <id>106</id>
+      <text>This is a talk page, not an article.</text>
+    </revision>
+  </page>
+</mediawiki>

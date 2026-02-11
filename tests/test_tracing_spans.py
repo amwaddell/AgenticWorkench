@@ -37,6 +37,8 @@ def _setup_test_tracing():
     """Set up tracing for tests with an in-memory exporter."""
     global _test_exporter, _test_tracer_provider
 
+    import workbench.observability.tracing as tracing_mod
+
     if _test_exporter is None:
         _test_exporter = InMemorySpanExporter()
 
@@ -59,11 +61,17 @@ def _setup_test_tracing():
             except Exception:
                 # Already set, that's ok
                 pass
+
+            # Critical: override tracing.py's module-level globals so that
+            # get_tracer() and start_span() use our test provider/tracer
+            # instead of one created by a previous setup_tracing() call.
+            tracing_mod._tracer_provider = _test_tracer_provider
+            tracing_mod._tracer = _test_tracer_provider.get_tracer(__name__)
         else:
             # Use stub setup
-            from workbench.observability.tracing import setup_tracing
-
-            setup_tracing("test-service", exporter=_test_exporter)
+            tracing_mod.setup_tracing(
+                "test-service", exporter=_test_exporter, force_reset=True
+            )
 
     # Clear spans before each test
     _test_exporter.clear()
