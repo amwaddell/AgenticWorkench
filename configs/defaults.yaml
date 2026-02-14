@@ -9,26 +9,33 @@ model:
   max_tokens: 2048
   timeout_seconds: 60
 
-# Embedding settings
+# Embedding settings 
 embeddings:
   provider: "sentence_transformers"
-  model_name: "all-MiniLM-L6-v2"
+  model_name: "intfloat/multilingual-e5-base"
   batch_size: 32
-  device: "cpu"
+  device: "mps"
 
 # Retrieval settings
 retrieval:
   strategy: "hybrid"
-  top_k: 20
-  keyword_weight: 0.3
-  vector_weight: 0.7
+  keyword_top_k: 20
+  vector_top_k: 20
+  merge_top_n: 50
+  rrf_k: 60
+  final_top_k: 5
 
 # Reranking settings
 reranking:
   enabled: true
   provider: "cross_encoder"
-  model_name: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  model_name: "BAAI/bge-reranker-v2-m3"
   top_n: 5
+
+# Context builder settings
+context:
+  max_tokens: 2048
+  max_chunks_per_doc: 3
 
 # Chunking settings
 chunking:
