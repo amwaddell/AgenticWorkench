@@ -40,7 +40,8 @@ from workbench.evaluation.reports import (
 )
 from workbench.models.llamacpp_server import LlamaCppServerModel
 from workbench.observability.logging import get_logger
-from workbench.observability.tracing import setup_tracing, start_span
+from workbench.observability.phoenix import setup_phoenix_tracing
+from workbench.observability.tracing import start_span
 from workbench.prompting.prompt_builder import PromptBuilder
 from workbench.retrieval.hybrid import HybridRetriever
 from workbench.retrieval.keyword_search import LanceDBKeywordSearcher
@@ -194,8 +195,8 @@ def main():
     cfg = load_config(config_path=config_path)
     config_snapshot = create_config_snapshot(cfg)
 
-    # Set up tracing
-    setup_tracing(service_name="researcher-eval")
+    # Set up tracing (sends spans to Phoenix on localhost:6006)
+    setup_phoenix_tracing(service_name="researcher-eval")
 
     # Load questions
     questions = load_history_questions()
