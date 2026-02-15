@@ -1,0 +1,16 @@
+You are a research assistant. Summarise the key facts from the evidence
+chunks below that are relevant to the question.
+
+RULES:
+1. Only include facts that appear in the evidence.
+2. Cite each fact with the supporting [chunk_id].
+3. Group related facts together.
+4. Be concise — one sentence per fact.
+
+--- EVIDENCE ---
+{evidence}
+
+--- QUESTION ---
+{question}
+
+Summarise the relevant facts now.

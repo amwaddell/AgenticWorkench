@@ -11,7 +11,7 @@ Every step produces a trace span, log event, and metrics record.
 
 Usage:
     loop = AgentLoop(
-        policy=ScriptedPolicy(),
+        policy=ResearcherPolicy(),
         search_tool=search_tool,
         open_chunk_tool=open_chunk_tool,
         model=llm,
@@ -29,27 +29,22 @@ from workbench.agents.state import (
     AgentState,
     OpenedChunk,
     RetrievedChunkSummary,
+    TimelineItem,
 )
 from workbench.observability.tracing import add_span_attributes, start_span
+from workbench.prompting.prompt_builder import (
+    PromptBuilder,
+    format_evidence_block,
+    format_timeline_section,
+)
 
-# Default answer prompt — inline for now; will move to prompting/ later.
-_SYSTEM_PROMPT = (
+# Fallback system prompt — used only when no PromptBuilder is wired in.
+_FALLBACK_SYSTEM_PROMPT = (
     "You are a helpful research assistant. Answer the user's question "
     "using ONLY the evidence provided below. For each claim, cite the "
     "source by writing [chunk_id] immediately after the claim.\n\n"
     "If the evidence does not contain enough information, say so honestly."
 )
-
-
-def _build_evidence_block(opened: list[OpenedChunk]) -> str:
-    """Format opened chunks into a numbered evidence block."""
-    parts: list[str] = []
-    for i, chunk in enumerate(opened, 1):
-        header = f"[{chunk.chunk_id}] {chunk.title}"
-        if chunk.section:
-            header += f" > {chunk.section}"
-        parts.append(f"--- Evidence {i}: {header} ---\n{chunk.text}")
-    return "\n\n".join(parts)
 
 
 class AgentLoop:
@@ -63,6 +58,8 @@ class AgentLoop:
         model: LanguageModel with ``.generate(messages, **settings)``.
         max_steps: Hard limit on loop iterations (safety guard).
         generation_settings: Extra kwargs forwarded to ``model.generate``.
+        prompt_builder: Optional PromptBuilder for template-based prompts.
+        timeline_tool: Optional TimelineTool for the BUILD_TIMELINE action.
     """
 
     def __init__(
@@ -73,6 +70,8 @@ class AgentLoop:
         model: Any,
         max_steps: int = 10,
         generation_settings: dict[str, Any] | None = None,
+        prompt_builder: Any | None = None,
+        timeline_tool: Any | None = None,
     ) -> None:
         self.policy = policy
         self.search_tool = search_tool
@@ -80,6 +79,8 @@ class AgentLoop:
         self.model = model
         self.max_steps = max_steps
         self.generation_settings = generation_settings or {}
+        self.prompt_builder: PromptBuilder | None = prompt_builder
+        self.timeline_tool = timeline_tool
 
     def run(self, state: AgentState) -> AgentState:
         """
@@ -119,6 +120,7 @@ class AgentLoop:
                     "total_steps": state.step,
                     "retrieved_count": len(state.retrieved),
                     "opened_count": len(state.opened),
+                    "timeline_count": len(state.timeline),
                     "answer_length": len(state.answer_text),
                     "has_error": state.error is not None,
                 }
@@ -140,6 +142,8 @@ class AgentLoop:
                     self._do_search(state, action)
                 elif action.action_type == ActionType.OPEN_CHUNKS:
                     self._do_open_chunks(state, action)
+                elif action.action_type == ActionType.BUILD_TIMELINE:
+                    self._do_timeline(state)
                 elif action.action_type == ActionType.GENERATE_ANSWER:
                     self._do_generate(state)
                 # STOP is handled in the run() loop above
@@ -180,21 +184,40 @@ class AgentLoop:
                 if result.get("found") and result.get("chunk"):
                     state.opened.append(OpenedChunk(**result["chunk"]))
 
+    def _do_timeline(self, state: AgentState) -> None:
+        """Build a timeline from opened evidence chunks."""
+        if self.timeline_tool is None:
+            # No timeline tool wired — skip silently so ScriptedPolicy
+            # still works if someone adds BUILD_TIMELINE by accident.
+            return
+
+        with start_span(
+            "tool.timeline",
+            attributes={"evidence_count": len(state.opened)},
+        ):
+            result = self.timeline_tool.execute(
+                question=state.question,
+                opened_chunks=state.opened,
+            )
+
+            for item_dict in result.get("timeline", []):
+                state.timeline.append(TimelineItem(**item_dict))
+
+            add_span_attributes(
+                {
+                    "timeline_count": len(state.timeline),
+                    "cited_chunk_count": len(result.get("cited_chunk_ids", [])),
+                }
+            )
+
     def _do_generate(self, state: AgentState) -> None:
         """Build prompt from evidence and call the model."""
-        evidence_block = _build_evidence_block(state.opened)
-
-        user_message = (
-            f"Evidence:\n{evidence_block}\n\n"
-            f"Question: {state.question}\n\n"
-            "Answer the question using the evidence above. "
-            "Cite sources using [chunk_id] notation."
-        )
-
-        messages = [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ]
+        if self.prompt_builder is not None:
+            # Use template-based prompt (Day 9+)
+            messages = self._build_templated_prompt(state)
+        else:
+            # Fallback to inline prompt (Day 8 compat)
+            messages = self._build_fallback_prompt(state)
 
         response = self.model.generate(messages, **self.generation_settings)
 
@@ -203,10 +226,40 @@ class AgentLoop:
         state.tokens_out = response.tokens_out
         state.model_latency_ms = response.latency_ms
 
-        # Extract cited chunk_ids from answer text (simple pattern match)
+        # Extract cited chunk_ids from answer text
         state.citations = self._extract_citations(
             response.text, [o.chunk_id for o in state.opened]
         )
+
+    def _build_templated_prompt(self, state: AgentState) -> list[dict[str, str]]:
+        """Build messages using the PromptBuilder and answer template."""
+        evidence = format_evidence_block(state.opened)
+        timeline_section = format_timeline_section(state.timeline)
+
+        user_prompt = self.prompt_builder.render(
+            "answer_with_citations",
+            question=state.question,
+            evidence=evidence,
+            timeline_section=timeline_section,
+        )
+
+        return [{"role": "user", "content": user_prompt}]
+
+    def _build_fallback_prompt(self, state: AgentState) -> list[dict[str, str]]:
+        """Build messages using the inline Day-8 approach."""
+        evidence_block = format_evidence_block(state.opened)
+
+        user_message = (
+            f"Evidence:\n{evidence_block}\n\n"
+            f"Question: {state.question}\n\n"
+            "Answer the question using the evidence above. "
+            "Cite sources using [chunk_id] notation."
+        )
+
+        return [
+            {"role": "system", "content": _FALLBACK_SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ]
 
     @staticmethod
     def _extract_citations(answer_text: str, known_ids: list[str]) -> list[str]:

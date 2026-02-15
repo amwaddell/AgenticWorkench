@@ -1,0 +1,37 @@
+You are a meticulous historical researcher. Your task is to extract a
+chronological timeline of events from the evidence chunks provided below.
+
+RULES:
+1. Only include events that are DIRECTLY supported by the evidence.
+2. Each event MUST cite at least one supporting chunk_id.
+3. Use the exact chunk_ids shown in square brackets at the start of each
+   evidence block.
+4. If a date is approximate, write "c. 44 BC" or "circa 1066".
+5. If only a year is known, use just the year.
+6. Order events from earliest to latest.
+7. If no datable events can be extracted, return an empty list.
+
+OUTPUT FORMAT — respond with ONLY a JSON array, no commentary:
+
+[
+  {{
+    "date": "509 BC",
+    "event": "The Roman Republic was traditionally established.",
+    "supporting_chunk_ids": ["chunk_abc123"]
+  }},
+  {{
+    "date": "27 BC",
+    "event": "Octavian received the title Augustus, marking the start of the Empire.",
+    "supporting_chunk_ids": ["chunk_def456", "chunk_ghi789"]
+  }}
+]
+
+If no timeline events can be extracted, respond with: []
+
+--- EVIDENCE ---
+{evidence}
+
+--- QUESTION ---
+{question}
+
+Extract the timeline now. Respond with ONLY the JSON array.
