@@ -17,26 +17,30 @@ This module provides:
 
 Usage:
     from workbench.retrieval.hybrid import HybridRetriever
+    from workbench.stores.chunk_store import ChunkStore
+
+    store = ChunkStore(db_path=Path("data/indexes/active/lancedb"))
 
     retriever = HybridRetriever(
         keyword_searcher=kw_searcher,
         vector_searcher=vec_searcher,
         reranker=cross_enc_reranker,     # optional
-        db_path=Path("data/indexes/active/lancedb"),
+        chunk_store=store,               # needed for reranking
     )
-    chunks = retriever.retrieve(Query(text="French Revolution"), top_k=5)
+    refs = retriever.retrieve(Query(text="French Revolution"), top_k=5)
+    # refs is list[ChunkRef] — lightweight, no full text
 """
 
 from __future__ import annotations
 
 import time
-from pathlib import Path
 from typing import Any
 
-import lancedb
-
-from workbench.core.types import Chunk, Query, RerankResult, RetrievalResult
+from workbench.core.types import ChunkRef, Query, RerankResult, RetrievalResult
 from workbench.observability.tracing import add_span_attributes, start_span
+
+# Snippet length included in ChunkRef objects
+_SNIPPET_CHARS = 200
 
 # ---------------------------------------------------------------------------
 # Pure fusion function
@@ -109,17 +113,17 @@ class HybridRetriever:
         1.  Keyword search  →  top *keyword_top_k* results
         2.  Vector search   →  top *vector_top_k* results
         3.  RRF merge       →  top *merge_top_n* candidates
-        4.  (optional) Cross-encoder rerank  →  top *top_k* results
-        5.  Return Chunk objects for the final candidates
+        4.  (optional) Cross-encoder rerank via ChunkStore  →  top *top_k*
+        5.  Return ``ChunkRef`` objects (lightweight, no full text)
 
     Satisfies the ``Retriever`` protocol.
 
     Args:
         keyword_searcher: KeywordSearcher instance.
         vector_searcher: VectorSearcher instance.
-        reranker: Optional Reranker instance.
-        db_path: LanceDB path — used to look up full chunk data for reranking.
-        table_name: LanceDB table name.
+        reranker: Optional Reranker instance (needs ``chunk_store`` too).
+        chunk_store: ChunkStore for fetching full text during reranking.
+            Required when a reranker is provided.
         keyword_top_k: How many keyword results to fetch before merge.
         vector_top_k: How many vector results to fetch before merge.
         merge_top_n: How many candidates to keep after RRF merge.
@@ -131,8 +135,7 @@ class HybridRetriever:
         keyword_searcher: Any,
         vector_searcher: Any,
         reranker: Any | None = None,
-        db_path: Path | None = None,
-        table_name: str = "chunks",
+        chunk_store: Any | None = None,
         keyword_top_k: int = 20,
         vector_top_k: int = 20,
         merge_top_n: int = 50,
@@ -141,18 +144,11 @@ class HybridRetriever:
         self.keyword_searcher = keyword_searcher
         self.vector_searcher = vector_searcher
         self.reranker = reranker
-        self.table_name = table_name
+        self.chunk_store = chunk_store
         self.keyword_top_k = keyword_top_k
         self.vector_top_k = vector_top_k
         self.merge_top_n = merge_top_n
         self.rrf_k = rrf_k
-
-        # LanceDB connection for chunk lookups
-        self._db = None
-        self._table = None
-        if db_path is not None:
-            self._db = lancedb.connect(str(db_path))
-            self._table = self._db.open_table(table_name)
 
     # ------------------------------------------------------------------
     # Public API
@@ -199,18 +195,21 @@ class HybridRetriever:
 
             return merged
 
-    def retrieve(self, query: Query, top_k: int = 5) -> list[Chunk]:
+    def retrieve(self, query: Query, top_k: int = 5) -> list[ChunkRef]:
         """
-        Full retrieval pipeline: merge → (rerank) → return Chunk objects.
+        Full retrieval pipeline: merge → (rerank) → return ChunkRef objects.
 
-        Satisfies the ``Retriever`` protocol.
+        Satisfies the ``Retriever`` protocol.  Returns lightweight
+        ``ChunkRef`` objects — no full chunk text.  The agent must
+        explicitly open chunks via ``ChunkStore.get()`` to read
+        the full evidence.
 
         Args:
             query: Query object.
             top_k: Number of final chunks to return.
 
         Returns:
-            List of Chunk objects, best first.
+            List of ChunkRef objects, best first.
         """
         with start_span(
             "retrieve.hybrid_pipeline",
@@ -222,91 +221,76 @@ class HybridRetriever:
         ):
             t0 = time.time()
 
-            # Step 1-3: merge
+            # Step 1-3: merge keyword + vector via RRF
             merged = self.merge(query)
 
-            # Look up full chunk data for merged candidates
-            chunks = self._lookup_chunks([r.chunk_id for r in merged])
+            if self.reranker is not None and self.chunk_store is not None:
+                # Step 4: rerank — needs full text from ChunkStore
+                chunk_ids = [r.chunk_id for r in merged]
+                full_chunks = self.chunk_store.get_many(chunk_ids)
 
-            if self.reranker is not None and chunks:
-                # Step 4: rerank
                 rerank_results: list[RerankResult] = self.reranker.rerank(
                     query,
-                    chunks,
+                    full_chunks,
                     top_n=top_k,
                 )
-                # Build a map of chunk_id → Chunk for fast lookup
-                chunk_map = {c.chunk_id: c for c in chunks}
-                final_chunks = [
-                    chunk_map[rr.chunk_id]
-                    for rr in rerank_results
-                    if rr.chunk_id in chunk_map
-                ]
+
+                # Build ChunkRef from rerank results + chunk data
+                chunk_map = {c.chunk_id: c for c in full_chunks}
+                refs = []
+                for rr in rerank_results:
+                    c = chunk_map.get(rr.chunk_id)
+                    if c is not None:
+                        refs.append(
+                            ChunkRef(
+                                chunk_id=rr.chunk_id,
+                                score=rr.rerank_score,
+                                title=c.title,
+                                section=c.section,
+                                snippet=c.text[:_SNIPPET_CHARS].replace("\n", " "),
+                            )
+                        )
             else:
-                # No reranker — just take top_k from merged order
-                final_chunks = chunks[:top_k]
+                # No reranker — build ChunkRef from merged metadata
+                refs = self._merged_to_refs(merged[:top_k])
 
             duration_ms = (time.time() - t0) * 1000
 
             add_span_attributes(
                 {
-                    "final_count": len(final_chunks),
+                    "final_count": len(refs),
                     "total_duration_ms": round(duration_ms, 1),
                 }
             )
 
-            return final_chunks
+            return refs
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _lookup_chunks(self, chunk_ids: list[str]) -> list[Chunk]:
+    @staticmethod
+    def _merged_to_refs(merged: list[RetrievalResult]) -> list[ChunkRef]:
         """
-        Fetch full chunk data from LanceDB by chunk_id.
+        Convert merged RetrievalResult objects to ChunkRef.
 
-        Args:
-            chunk_ids: Ordered list of chunk_ids to look up.
-
-        Returns:
-            List of Chunk objects in the same order (missing ids skipped).
+        Uses the metadata dict (populated by keyword/vector searchers)
+        to fill title, section, and snippet without a DB round-trip.
         """
-        if not chunk_ids or self._table is None:
-            return []
-
-        # Query LanceDB for all matching chunk_ids in one go.
-        # We use a filter expression to fetch them.
-        id_set = set(chunk_ids)
-
-        # LanceDB to_pandas then filter is reliable across versions
-        all_data = self._table.to_pandas()
-        matched = all_data[all_data["chunk_id"].isin(id_set)]
-
-        # Build a lookup dict
-        row_map: dict[str, dict] = {}
-        for _, row in matched.iterrows():
-            row_map[row["chunk_id"]] = row.to_dict()
-
-        # Preserve the requested order
-        chunks: list[Chunk] = []
-        for cid in chunk_ids:
-            if cid not in row_map:
-                continue
-            r = row_map[cid]
-            chunks.append(
-                Chunk(
-                    chunk_id=r["chunk_id"],
-                    document_id=r.get("document_id", ""),
-                    title=r.get("title", ""),
-                    section=r.get("section", None),
-                    text=r.get("text", ""),
-                    start_offset=0,  # not stored in index
-                    end_offset=0,  # not stored in index
-                    token_count=len(r.get("text", "")) // 4,  # rough estimate
+        refs: list[ChunkRef] = []
+        for r in merged:
+            meta = r.metadata
+            text = meta.get("text", "")
+            refs.append(
+                ChunkRef(
+                    chunk_id=r.chunk_id,
+                    score=r.score,
+                    title=meta.get("title", ""),
+                    section=meta.get("section", None),
+                    snippet=text[:_SNIPPET_CHARS].replace("\n", " ") if text else "",
                 )
             )
-
-        return chunks
+        return refs
 
     def __repr__(self) -> str:
         return (

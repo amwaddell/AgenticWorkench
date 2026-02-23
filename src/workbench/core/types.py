@@ -63,6 +63,28 @@ class RetrievalResult(BaseModel):
     )
 
 
+class ChunkRef(BaseModel):
+    """
+    Lightweight reference to a chunk — id, score, and minimal metadata.
+
+    Returned by the retrieval pipeline instead of a full ``Chunk``.
+    The full text is only fetched when the agent explicitly *opens*
+    a chunk via ``ChunkStore.get()``.
+
+    This keeps the search step cheap (no large text payloads) and
+    makes the "open" action a deliberate, observable step.
+    """
+
+    chunk_id: str = Field(..., description="Unique chunk identifier")
+    score: float = Field(..., description="Retrieval or rerank score")
+    title: str = Field(default="", description="Document title")
+    section: str | None = Field(None, description="Section heading if available")
+    snippet: str = Field(
+        default="",
+        description="Short preview of chunk text (first N chars)",
+    )
+
+
 class RerankResult(BaseModel):
     """Result after reranking."""
 

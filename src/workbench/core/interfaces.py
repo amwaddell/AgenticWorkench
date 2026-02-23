@@ -9,6 +9,7 @@ from typing import Any, Protocol
 
 from workbench.core.types import (
     Chunk,
+    ChunkRef,
     ModelResponse,
     Query,
     RerankResult,
@@ -190,9 +191,11 @@ class Retriever(Protocol):
     Interface for complete retrieval pipeline.
 
     This can combine keyword + vector + reranking.
+    Returns lightweight ``ChunkRef`` objects (not full text).
+    Use ``ChunkStore.get()`` to fetch full chunk data when needed.
     """
 
-    def retrieve(self, query: Query, top_k: int = 5) -> list[Chunk]:
+    def retrieve(self, query: Query, top_k: int = 5) -> list[ChunkRef]:
         """
         Retrieve most relevant chunks for a query.
 
@@ -201,6 +204,6 @@ class Retriever(Protocol):
             top_k: Number of final chunks to return
 
         Returns:
-            List of retrieved and ranked chunks
+            List of lightweight ChunkRef objects (id, score, title, snippet).
         """
         ...

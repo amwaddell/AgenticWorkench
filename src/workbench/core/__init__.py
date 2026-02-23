@@ -40,6 +40,7 @@ from workbench.core.run_context import (
 from workbench.core.types import (
     Answer,
     Chunk,
+    ChunkRef,
     Document,
     ModelResponse,
     Query,
@@ -52,6 +53,7 @@ __all__ = [
     # Types
     "Document",
     "Chunk",
+    "ChunkRef",
     "Query",
     "RetrievalResult",
     "RerankResult",

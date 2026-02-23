@@ -25,6 +25,8 @@ from pathlib import Path
 # Ensure src/ is on the path when running as a script
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from workbench.stores.chunk_store import ChunkStore
+
 from workbench.agents.loops import AgentLoop
 from workbench.agents.policies import ResearcherPolicy
 from workbench.agents.state import AgentState
@@ -77,12 +79,15 @@ def build_components(cfg):
     if cfg.reranking.get("enabled", True):
         reranker = CrossEncoderReranker(model_name=cfg.reranking["model_name"])
 
+    # Chunk store — single source of truth for chunk lookups
+    chunk_store = ChunkStore(db_path=db_path)
+
     retrieval_cfg = cfg.retrieval
     retriever = HybridRetriever(
         keyword_searcher=keyword_searcher,
         vector_searcher=vector_searcher,
         reranker=reranker,
-        db_path=db_path,
+        chunk_store=chunk_store,
         keyword_top_k=retrieval_cfg.get("keyword_top_k", 20),
         vector_top_k=retrieval_cfg.get("vector_top_k", 20),
         merge_top_n=retrieval_cfg.get("merge_top_n", 50),
@@ -90,7 +95,7 @@ def build_components(cfg):
     )
 
     search_tool = SearchWikipediaTool(retriever=retriever)
-    open_chunk_tool = OpenChunkTool(db_path=db_path)
+    open_chunk_tool = OpenChunkTool(chunk_store=chunk_store)
     prompt_builder = PromptBuilder()
     timeline_tool = TimelineTool(
         model=model,

@@ -1,6 +1,10 @@
 """
 SearchWikipedia tool: run hybrid retrieval and return chunk summaries.
 
+The retriever returns lightweight ``ChunkRef`` objects (no full text).
+This tool converts them to ``RetrievedChunkSummary`` dicts for the
+agent state.
+
 Satisfies the ``Tool`` protocol from ``workbench.core.interfaces``.
 
 Usage:
@@ -17,7 +21,7 @@ from workbench.agents.state import RetrievedChunkSummary
 from workbench.core.types import Query
 from workbench.observability.tracing import add_span_attributes, start_span
 
-# Snippet length for summaries
+# Snippet length for agent-facing summaries
 _SNIPPET_CHARS = 120
 
 
@@ -27,7 +31,7 @@ class SearchWikipediaTool:
 
     Args:
         retriever: Any object with a ``retrieve(query, top_k)`` method
-                   returning a list of Chunk objects.
+                   returning a list of ``ChunkRef`` objects.
     """
 
     name: str = "search_wikipedia"
@@ -69,16 +73,16 @@ class SearchWikipediaTool:
             t0 = time.time()
 
             query = Query(text=query_text)
-            chunks = self.retriever.retrieve(query, top_k=top_k)
+            refs = self.retriever.retrieve(query, top_k=top_k)
 
             summaries: list[RetrievedChunkSummary] = []
-            for i, chunk in enumerate(chunks):
+            for ref in refs:
                 summaries.append(
                     RetrievedChunkSummary(
-                        chunk_id=chunk.chunk_id,
-                        score=1.0 / (i + 1),  # rank-based score
-                        title=chunk.title,
-                        snippet=chunk.text[:_SNIPPET_CHARS].replace("\n", " "),
+                        chunk_id=ref.chunk_id,
+                        score=ref.score,
+                        title=ref.title,
+                        snippet=ref.snippet[:_SNIPPET_CHARS],
                     )
                 )
 

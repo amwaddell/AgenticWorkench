@@ -41,6 +41,7 @@ from workbench.retrieval.hybrid import HybridRetriever
 from workbench.retrieval.keyword_search import LanceDBKeywordSearcher
 from workbench.retrieval.rerankers import CrossEncoderReranker
 from workbench.retrieval.vector_search import LanceDBVectorSearcher
+from workbench.stores.chunk_store import ChunkStore
 from workbench.tools.open_chunk import OpenChunkTool
 from workbench.tools.search_wikipedia import SearchWikipediaTool
 
@@ -74,6 +75,7 @@ class ChatbotSystem:
         self._keyword_searcher: LanceDBKeywordSearcher | None = None
         self._vector_searcher: LanceDBVectorSearcher | None = None
         self._reranker: CrossEncoderReranker | None = None
+        self._chunk_store: ChunkStore | None = None
         self._retriever: HybridRetriever | None = None
         self._search_tool: SearchWikipediaTool | None = None
         self._open_chunk_tool: OpenChunkTool | None = None
@@ -116,22 +118,25 @@ class ChatbotSystem:
                 model_name=cfg.reranking["model_name"],
             )
 
-        # 5. Hybrid retriever
+        # 5. Chunk store — single source of truth for chunk lookups
+        self._chunk_store = ChunkStore(db_path=db_path)
+
+        # 6. Hybrid retriever
         retrieval_cfg = cfg.retrieval
         self._retriever = HybridRetriever(
             keyword_searcher=self._keyword_searcher,
             vector_searcher=self._vector_searcher,
             reranker=self._reranker,
-            db_path=db_path,
+            chunk_store=self._chunk_store,
             keyword_top_k=retrieval_cfg.get("keyword_top_k", 20),
             vector_top_k=retrieval_cfg.get("vector_top_k", 20),
             merge_top_n=retrieval_cfg.get("merge_top_n", 50),
             rrf_k=retrieval_cfg.get("rrf_k", 60),
         )
 
-        # 6. Tools
+        # 7. Tools
         self._search_tool = SearchWikipediaTool(retriever=self._retriever)
-        self._open_chunk_tool = OpenChunkTool(db_path=db_path)
+        self._open_chunk_tool = OpenChunkTool(chunk_store=self._chunk_store)
 
         self._components_built = True
         print("Components built successfully.")
