@@ -6,7 +6,7 @@ for analysis and optimization.
 """
 
 import sqlite3
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from workbench.core.run_context import get_run_context
@@ -136,7 +136,7 @@ class MetricsStore:
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                datetime.utcnow().isoformat(),
+                datetime.now(UTC).isoformat(),
                 run_id,
                 component_name,
                 component_type,
@@ -186,7 +186,7 @@ class MetricsStore:
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                datetime.utcnow().isoformat(),
+                datetime.now(UTC).isoformat(),
                 run_id,
                 model_name,
                 tokens_in,
@@ -243,7 +243,7 @@ class MetricsStore:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                datetime.utcnow().isoformat(),
+                datetime.now(UTC).isoformat(),
                 run_id,
                 query,
                 keyword_candidates,

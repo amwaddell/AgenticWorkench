@@ -4,7 +4,7 @@
 model:
   provider: "llamacpp_server"
   base_url: "http://localhost:8080"
-  model_name: "ministral-8b"
+  model_name: "ministral-3-8b-instruct"
   temperature: 0.7
   max_tokens: 2048
   timeout_seconds: 60

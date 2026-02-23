@@ -6,7 +6,7 @@ Each line is a complete JSON object for easy parsing and analysis.
 """
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -45,7 +45,7 @@ class JSONLinesLogger:
             level: Log level (INFO, WARNING, ERROR)
         """
         event = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "event_type": event_type,
             "level": level,
         }

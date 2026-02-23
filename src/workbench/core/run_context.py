@@ -8,7 +8,7 @@ without passing it through every function call.
 import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Optional
 
 # Context variable for the current run
@@ -57,7 +57,7 @@ class RunContext:
 
         return cls(
             run_id=run_id,
-            start_time=datetime.utcnow(),
+            start_time=datetime.now(UTC),
             config_snapshot=config_snapshot,
             run_type=run_type,
             metadata=metadata,
@@ -81,7 +81,7 @@ def generate_run_id() -> str:
     Format: timestamp_uuid
     Example: 20240209_143052_a1b2c3d4
     """
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     short_uuid = str(uuid.uuid4())[:8]
     return f"{timestamp}_{short_uuid}"
 

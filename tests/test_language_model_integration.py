@@ -18,6 +18,28 @@ from workbench.observability.tracing import setup_tracing
 pytestmark = pytest.mark.integration
 
 
+def _server_is_reachable(base_url: str = "http://localhost:8080") -> bool:
+    """Check if the model server is reachable."""
+    try:
+        import httpx
+
+        response = httpx.get(f"{base_url}/v1/models", timeout=2.0)
+        return response.status_code == 200
+    except Exception:
+        return False
+
+
+# Auto-skip entire module if model server is not running
+if not _server_is_reachable():
+    pytestmark = [
+        pytestmark,
+        pytest.mark.skip(
+            reason="Model server not running at localhost:8080. "
+            "Start with: bash scripts/start_model_server.sh"
+        ),
+    ]
+
+
 @pytest.fixture(scope="module")
 def setup_observability():
     """Set up tracing for integration tests."""
@@ -196,10 +218,14 @@ def test_context_manager(config):
 
     with LlamaCppServerModel(
         base_url=model_config.get("base_url", "http://localhost:8080"),
-    ) as model:
-        messages = [{"role": "user", "content": "Hi"}]
-        response = model.generate(messages, max_tokens=10)
-        assert response is not None
+        model_name=model_config.get("model_name", "local-model"),
+    ) as m:
+        # Verify context manager returns usable instance
+        assert m is not None
+        assert hasattr(m, "generate")
+
+    # Verify __exit__ closed the client
+    assert m.client.is_closed
 
     print("\n✓ Context manager usage")
 
@@ -211,5 +237,7 @@ if __name__ == "__main__":
     print("Start the server with:")
     print("  bash scripts/start_model_server.sh")
     print("\nThen run:")
-    print("  python -m pytest tests/test_language_model_integration.py -v")
+    print(
+        "  python -m pytest tests/test_language_model_integration.py -m integration -v"
+    )
     print("=" * 70)

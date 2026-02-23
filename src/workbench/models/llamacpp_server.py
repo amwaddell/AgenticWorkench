@@ -28,10 +28,10 @@ from workbench.observability.tracing import start_span
 
 class LlamaCppServerModel:
     """
-    Language model adapter for llama-cpp-python server.
+    Language model adapter for llama.cpp's OpenAI-compatible server.
 
-    This adapter connects to a local llama.cpp server running with:
-        python3 -m llama_cpp.server --model <path-to-gguf>
+    This adapter connects to a local llama-server instance:
+        bash scripts/start_model_server.sh
 
     The server provides an OpenAI-compatible API at /v1/chat/completions.
     """

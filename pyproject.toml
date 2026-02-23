@@ -14,10 +14,13 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
-pythonpath = ["src"]
+addopts = "-q -m 'not integration'"
+pythonpath = ["src", "."]
 markers = [
     "integration: marks tests as integration tests (require external services like model server)",
+]
+filterwarnings = [
+    "error::DeprecationWarning",
 ]
 
 [tool.ruff]
