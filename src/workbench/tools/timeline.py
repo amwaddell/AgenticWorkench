@@ -4,30 +4,61 @@ Timeline tool: extract a chronological timeline from evidence chunks.
 The tool calls the language model with a structured-output prompt and
 parses the JSON response into a list of ``TimelineItem`` objects.
 
-Satisfies the ``Tool`` protocol from ``workbench.core.interfaces``.
+Migrated to ``ToolSpec`` (Day 2): args are validated via Pydantic,
+and tracing / logging / metrics hooks are automatic.
 
-Usage:
+Usage (direct):
     tool = TimelineTool(model=llm, prompt_builder=pb)
     result = tool.execute(
         question="When did the Roman Republic end?",
         opened_chunks=[...],
     )
-    print(result["timeline"])   # list of TimelineItem dicts
+
+Usage (LangGraph):
+    lc_tool = tool.to_langchain_tool()
 """
 
 from __future__ import annotations
 
 import json
 import re
-import time
 from typing import Any
 
+from pydantic import BaseModel, Field
+
 from workbench.agents.state import OpenedChunk, TimelineItem
-from workbench.observability.tracing import add_span_attributes, start_span
+from workbench.observability.tracing import add_span_attributes
 from workbench.prompting.prompt_builder import PromptBuilder, format_evidence_block
+from workbench.tools.base import ToolSpec
+
+# ------------------------------------------------------------------ #
+#  Args schema                                                        #
+# ------------------------------------------------------------------ #
 
 
-class TimelineTool:
+class TimelineArgs(BaseModel):
+    """Input schema for the timeline tool.
+
+    ``opened_chunks`` accepts both plain dicts (from LangGraph JSON)
+    and ``OpenedChunk`` Pydantic objects (from the agent loop).
+    """
+
+    question: str = Field(..., description="The research question.")
+    opened_chunks: list[Any] = Field(
+        ...,
+        description=(
+            "Evidence chunks — list of dicts or OpenedChunk objects "
+            "with keys: chunk_id, document_id, title, section, text."
+        ),
+    )
+
+
+# ------------------------------------------------------------------ #
+#  Tool implementation                                                #
+# ------------------------------------------------------------------ #
+
+
+class TimelineTool(ToolSpec):
     """
     Extract a date-ordered timeline of events from opened evidence.
 
@@ -42,6 +73,7 @@ class TimelineTool:
         "Extract a chronological timeline of events from evidence chunks. "
         "Each event is tied to one or more supporting chunk_ids."
     )
+    args_schema = TimelineArgs
 
     def __init__(
         self,
@@ -53,27 +85,22 @@ class TimelineTool:
         self.prompt_builder = prompt_builder or PromptBuilder()
         self.generation_settings = generation_settings or {}
 
-    def execute(self, **kwargs: Any) -> dict[str, Any]:
+    def run(self, **kwargs: Any) -> dict[str, Any]:
         """
-        Extract a timeline.
+        Extract a timeline from evidence chunks.
 
-        Kwargs:
-            question (str): The research question.
-            opened_chunks (list[OpenedChunk | dict]): Evidence chunks.
+        Args (validated by TimelineArgs):
+            question: The research question.
+            opened_chunks: Evidence chunks as list of dicts.
 
         Returns:
-            Dict with keys:
-                timeline: list of TimelineItem dicts
-                count: number of items
-                cited_chunk_ids: deduplicated list of cited chunks
-                duration_ms: latency
-                raw_model_output: the raw text from the model
-                prompt_version: hash of the template used
+            Dict with keys: timeline, count, cited_chunk_ids,
+            raw_model_output, prompt_version.
         """
-        question: str = kwargs.get("question", "")
-        raw_chunks = kwargs.get("opened_chunks", [])
+        question: str = kwargs["question"]
+        raw_chunks: list[dict[str, Any]] = kwargs["opened_chunks"]
 
-        # Accept both OpenedChunk objects and plain dicts
+        # Convert dicts to OpenedChunk objects
         opened: list[OpenedChunk] = []
         for c in raw_chunks:
             if isinstance(c, OpenedChunk):
@@ -81,61 +108,46 @@ class TimelineTool:
             elif isinstance(c, dict):
                 opened.append(OpenedChunk(**c))
 
-        with start_span(
-            "tool.timeline",
-            attributes={
-                "question": question[:200],
-                "evidence_count": len(opened),
-            },
-        ):
-            t0 = time.time()
+        # Build the prompt
+        evidence = format_evidence_block(opened)
+        user_prompt = self.prompt_builder.render(
+            "timeline_extract",
+            question=question,
+            evidence=evidence,
+        )
+        prompt_version = self.prompt_builder.get_version("timeline_extract")
 
-            # Build the prompt
-            evidence = format_evidence_block(opened)
-            user_prompt = self.prompt_builder.render(
-                "timeline_extract",
-                question=question,
-                evidence=evidence,
-            )
-            prompt_version = self.prompt_builder.get_version("timeline_extract")
+        messages = [{"role": "user", "content": user_prompt}]
 
-            messages = [
-                {"role": "user", "content": user_prompt},
-            ]
+        # Call model
+        response = self.model.generate(messages, **self.generation_settings)
 
-            # Call model
-            response = self.model.generate(messages, **self.generation_settings)
+        # Parse response
+        timeline_items = self._parse_timeline(
+            response.text,
+            known_chunk_ids={c.chunk_id for c in opened},
+        )
 
-            # Parse response
-            timeline_items = self._parse_timeline(
-                response.text,
-                known_chunk_ids={c.chunk_id for c in opened},
-            )
+        # Collect all cited chunk_ids
+        cited: set[str] = set()
+        for item in timeline_items:
+            cited.update(item.supporting_chunk_ids)
 
-            duration_ms = (time.time() - t0) * 1000
-
-            # Collect all cited chunk_ids
-            cited: set[str] = set()
-            for item in timeline_items:
-                cited.update(item.supporting_chunk_ids)
-
-            add_span_attributes(
-                {
-                    "timeline_count": len(timeline_items),
-                    "cited_chunk_count": len(cited),
-                    "duration_ms": round(duration_ms, 1),
-                    "prompt_version": prompt_version,
-                }
-            )
-
-            return {
-                "timeline": [item.model_dump() for item in timeline_items],
-                "count": len(timeline_items),
-                "cited_chunk_ids": sorted(cited),
-                "duration_ms": round(duration_ms, 1),
-                "raw_model_output": response.text,
+        add_span_attributes(
+            {
+                "timeline_count": len(timeline_items),
+                "cited_chunk_count": len(cited),
                 "prompt_version": prompt_version,
             }
+        )
+
+        return {
+            "timeline": [item.model_dump() for item in timeline_items],
+            "count": len(timeline_items),
+            "cited_chunk_ids": sorted(cited),
+            "raw_model_output": response.text,
+            "prompt_version": prompt_version,
+        }
 
     # ------------------------------------------------------------------ #
     #  Parsing helpers                                                     #

@@ -5,27 +5,55 @@ The retriever returns lightweight ``ChunkRef`` objects (no full text).
 This tool converts them to ``RetrievedChunkSummary`` dicts for the
 agent state.
 
-Satisfies the ``Tool`` protocol from ``workbench.core.interfaces``.
+Migrated to ``ToolSpec`` (Day 2): args are validated via Pydantic,
+and tracing / logging / metrics hooks are automatic.
 
-Usage:
+Usage (direct):
     tool = SearchWikipediaTool(retriever=hybrid_retriever)
     result = tool.execute(query="French Revolution", top_k=5)
+
+Usage (LangGraph):
+    lc_tool = tool.to_langchain_tool()
 """
 
 from __future__ import annotations
 
-import time
 from typing import Any
+
+from pydantic import BaseModel, Field
 
 from workbench.agents.state import RetrievedChunkSummary
 from workbench.core.types import Query
-from workbench.observability.tracing import add_span_attributes, start_span
+from workbench.observability.tracing import add_span_attributes
+from workbench.tools.base import ToolSpec
 
 # Snippet length for agent-facing summaries
 _SNIPPET_CHARS = 120
 
 
-class SearchWikipediaTool:
+# ------------------------------------------------------------------ #
+#  Args schema                                                        #
+# ------------------------------------------------------------------ #
+
+
+class SearchWikipediaArgs(BaseModel):
+    """Input schema for the search_wikipedia tool."""
+
+    query: str = Field(..., description="The search query text.")
+    top_k: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        description="Number of chunks to retrieve.",
+    )
+
+
+# ------------------------------------------------------------------ #
+#  Tool implementation                                                #
+# ------------------------------------------------------------------ #
+
+
+class SearchWikipediaTool(ToolSpec):
     """
     Tool that searches Wikipedia chunks via the hybrid retriever.
 
@@ -39,67 +67,48 @@ class SearchWikipediaTool:
         "Search the Wikipedia knowledge base for chunks relevant to a query. "
         "Returns chunk IDs, scores, titles and short snippets."
     )
+    args_schema = SearchWikipediaArgs
 
     def __init__(self, retriever: Any) -> None:
         self.retriever = retriever
 
-    def execute(self, **kwargs: Any) -> dict[str, Any]:
+    def run(self, **kwargs: Any) -> dict[str, Any]:
         """
-        Execute a search.
+        Execute the search.
 
-        Kwargs:
-            query (str): The search query text.
-            top_k (int): Number of chunks to retrieve (default 5).
+        Args (validated by SearchWikipediaArgs):
+            query: The search query text.
+            top_k: Number of chunks to retrieve.
 
         Returns:
-            Dict with keys:
-                chunks: list of RetrievedChunkSummary dicts
-                count: number of results
-                duration_ms: search latency
+            Dict with keys: chunks, count, duration_ms.
         """
-        query_text: str = kwargs.get("query", "")
-        top_k: int = kwargs.get("top_k", 5)
+        query_text: str = kwargs["query"]
+        top_k: int = kwargs["top_k"]
 
         if not query_text:
-            return {"chunks": [], "count": 0, "duration_ms": 0.0}
+            return {"chunks": [], "count": 0}
 
-        with start_span(
-            "tool.search_wikipedia",
-            attributes={
-                "query_text": query_text[:200],
-                "top_k": top_k,
-            },
-        ):
-            t0 = time.time()
+        query = Query(text=query_text)
+        refs = self.retriever.retrieve(query, top_k=top_k)
 
-            query = Query(text=query_text)
-            refs = self.retriever.retrieve(query, top_k=top_k)
-
-            summaries: list[RetrievedChunkSummary] = []
-            for ref in refs:
-                summaries.append(
-                    RetrievedChunkSummary(
-                        chunk_id=ref.chunk_id,
-                        score=ref.score,
-                        title=ref.title,
-                        snippet=ref.snippet[:_SNIPPET_CHARS],
-                    )
+        summaries: list[RetrievedChunkSummary] = []
+        for ref in refs:
+            summaries.append(
+                RetrievedChunkSummary(
+                    chunk_id=ref.chunk_id,
+                    score=ref.score,
+                    title=ref.title,
+                    snippet=ref.snippet[:_SNIPPET_CHARS],
                 )
-
-            duration_ms = (time.time() - t0) * 1000
-
-            add_span_attributes(
-                {
-                    "results_count": len(summaries),
-                    "duration_ms": round(duration_ms, 1),
-                }
             )
 
-            return {
-                "chunks": [s.model_dump() for s in summaries],
-                "count": len(summaries),
-                "duration_ms": round(duration_ms, 1),
-            }
+        add_span_attributes({"results_count": len(summaries)})
+
+        return {
+            "chunks": [s.model_dump() for s in summaries],
+            "count": len(summaries),
+        }
 
     def __repr__(self) -> str:
         return f"SearchWikipediaTool(retriever={self.retriever!r})"
