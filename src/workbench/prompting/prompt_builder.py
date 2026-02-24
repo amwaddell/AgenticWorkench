@@ -8,10 +8,22 @@ The builder hashes the raw template text to produce a short version tag
 so every logged prompt can be traced back to the exact template that
 produced it.
 
-Usage:
+Usage (original render API)::
+
     pb = PromptBuilder()
     prompt = pb.render("timeline_extract", question="...", evidence="...")
     print(pb.get_version("timeline_extract"))   # e.g. "v-3a8c1f"
+
+Usage (new build API — returns messages + metadata)::
+
+    pb = PromptBuilder()
+    messages, meta = pb.build(
+        "answer_with_citations",
+        question="When did Rome fall?",
+        opened_chunks=opened,          # list[OpenedChunk] or list[dict]
+    )
+    # meta = {"variant": "answer_with_citations", "template": "...",
+    #         "version": "v-...", "evidence_count": 3, ...}
 """
 
 from __future__ import annotations
@@ -99,6 +111,92 @@ class PromptBuilder:
     def list_templates(self) -> list[str]:
         """Return names of all available templates."""
         return sorted(p.stem for p in self.templates_dir.glob("*.txt"))
+
+    # ----------------------------------------------------------------- #
+    #  High-level build API (Day 3+)                                    #
+    # ----------------------------------------------------------------- #
+
+    def build(
+        self,
+        variant: str,
+        *,
+        question: str,
+        opened_chunks: list[OpenedChunk] | list[dict[str, Any]],
+        timeline: list[TimelineItem] | list[dict[str, Any]] | None = None,
+        extra_instructions: str | None = None,
+    ) -> tuple[list[dict[str, str]], dict[str, Any]]:
+        """
+        Build prompt messages and metadata for a given template variant.
+
+        This is the recommended entry point for graph nodes and any
+        future system that needs a prompt.  It normalises inputs
+        (accepts both Pydantic objects and plain dicts), renders the
+        template, and returns a ``(messages, meta)`` tuple so the
+        caller can pass messages straight to the model and log meta
+        for observability.
+
+        Args:
+            variant:  Template name (e.g. ``"answer_with_citations"``).
+            question:  The user question.
+            opened_chunks:  Evidence chunks — accepts ``OpenedChunk``
+                            Pydantic objects **or** plain dicts (as
+                            they appear in LangGraph state).
+            timeline:  Optional timeline items — accepts ``TimelineItem``
+                       objects or plain dicts.  Pass ``None`` or ``[]``
+                       to omit the timeline section.
+            extra_instructions:  Optional text prepended to the rendered
+                                 prompt (for prompt variants without a
+                                 new template file).
+
+        Returns:
+            ``(messages, meta)`` where:
+            - **messages** is a ``list[dict]`` ready for
+              ``model.generate(messages)``.
+            - **meta** is a dict with keys ``variant``, ``template``,
+              ``version``, ``evidence_count``, ``timeline_count``.
+        """
+        # --- Normalise chunks to OpenedChunk objects ----------------
+        normalised_chunks: list[OpenedChunk] = []
+        for c in opened_chunks:
+            if isinstance(c, dict):
+                normalised_chunks.append(OpenedChunk(**c))
+            else:
+                normalised_chunks.append(c)
+
+        # --- Normalise timeline to TimelineItem objects --------------
+        normalised_timeline: list[TimelineItem] = []
+        if timeline:
+            for t in timeline:
+                if isinstance(t, dict):
+                    normalised_timeline.append(TimelineItem(**t))
+                else:
+                    normalised_timeline.append(t)
+
+        # --- Render -------------------------------------------------
+        evidence = format_evidence_block(normalised_chunks)
+        timeline_section = format_timeline_section(normalised_timeline)
+
+        user_prompt = self.render(
+            variant,
+            question=question,
+            evidence=evidence,
+            timeline_section=timeline_section,
+        )
+
+        if extra_instructions:
+            user_prompt = f"{extra_instructions}\n\n{user_prompt}"
+
+        messages = [{"role": "user", "content": user_prompt}]
+
+        meta: dict[str, Any] = {
+            "variant": variant,
+            "template": f"{variant}.txt",
+            "version": self.get_version(variant),
+            "evidence_count": len(normalised_chunks),
+            "timeline_count": len(normalised_timeline),
+        }
+
+        return messages, meta
 
 
 # --------------------------------------------------------------------- #
