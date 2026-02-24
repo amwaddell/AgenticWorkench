@@ -44,6 +44,19 @@ chunking:
   overlap_tokens: 50
   min_chunk_tokens: 100
 
+# Web search settings (Day 5)
+web_search:
+  enabled: true
+  provider: "duckduckgo"            # "duckduckgo" (zero-key) or "tavily" (needs TAVILY_API_KEY)
+  max_results: 5
+  confidence_threshold: 2           # min retrieval results before web fallback triggers
+
+# Source fetch settings (Day 5)
+source_fetch:
+  timeout_seconds: 15
+  max_chars: 8000
+  user_agent: "AgenticWorkbench/1.0"
+
 # Data paths
 paths:
   data_dir: "./data"
@@ -66,3 +79,4 @@ observability:
   enable_metrics: true
   phoenix_endpoint: "http://localhost:6006"
   log_level: "INFO"
+  

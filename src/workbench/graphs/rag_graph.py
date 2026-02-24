@@ -2,15 +2,25 @@
 RAG graph: search → open → answer as a compiled LangGraph.
 
 This graph replaces the sequential ``AgentLoop`` + ``ScriptedPolicy``
-combination with an explicit three-node DAG:
+combination with an explicit DAG.
 
-    retrieve_node  →  open_node  →  answer_node  →  END
+**Day 5 addition**: an optional web search fallback.  When
+``web_search_tool`` is provided to ``build_rag_graph()``, the graph
+adds a confidence-check node after retrieval.  If retrieval returns
+fewer results than ``confidence_threshold``, the graph branches to
+a web search node before proceeding to the answer.
 
-Each node reads from ``RAGState``, calls the relevant tool or model,
-and returns a partial state update dict.  The graph is compiled once
-via ``build_rag_graph()`` and invoked per-question via ``invoke()``
-or the convenience ``run_rag_graph()`` wrapper (which adds run_context,
-logging, and metrics).
+Topology (without web search)::
+
+    retrieve  →  open  →  answer  →  END
+
+Topology (with web search)::
+
+    retrieve → check_confidence ──[sufficient]──→ open → answer → END
+                                   │
+                               [low_confidence]
+                                   │
+                              web_search → open → answer → END
 
 Usage (standalone)::
 
@@ -22,6 +32,16 @@ Usage (standalone)::
     )
     result = graph.invoke({"question": "When did the Roman Republic end?"})
     print(result["answer_text"])
+
+Usage (with web search fallback)::
+
+    graph = build_rag_graph(
+        search_tool=search_tool,
+        open_chunk_tool=open_chunk_tool,
+        model=llm,
+        web_search_tool=WebSearchTool(),
+        confidence_threshold=2,
+    )
 
 Usage (with observability)::
 
@@ -76,6 +96,24 @@ def extract_citations(answer_text: str, known_ids: list[str]) -> list[str]:
     return cited
 
 
+def extract_web_citations(answer_text: str, urls: list[str]) -> list[str]:
+    """
+    Find URLs mentioned in the answer text.
+
+    Args:
+        answer_text: The generated answer string.
+        urls: List of URLs from web search results.
+
+    Returns:
+        List of cited URLs found in the text.
+    """
+    cited: list[str] = []
+    for url in urls:
+        if url in answer_text:
+            cited.append(url)
+    return cited
+
+
 # ------------------------------------------------------------------ #
 #  Node factories (closures over injected dependencies)               #
 # ------------------------------------------------------------------ #
@@ -115,6 +153,79 @@ def _make_retrieve_node(
                 }
 
     return retrieve_node
+
+
+def _make_check_confidence_node(threshold: int) -> Any:
+    """
+    Create a confidence-check node.
+
+    If retrieval returned fewer than ``threshold`` results, this
+    signals that a web search fallback should be used.  The node
+    itself doesn't branch — it just writes ``web_search_used``
+    into state.  The conditional edge reads that flag.
+    """
+
+    def check_confidence_node(state: RAGState) -> dict[str, Any]:
+        retrieved = state.get("retrieved", [])
+        needs_web = len(retrieved) < threshold
+
+        with start_span(
+            "graph.check_confidence",
+            attributes={
+                "retrieved_count": len(retrieved),
+                "threshold": threshold,
+                "needs_web_search": needs_web,
+            },
+        ):
+            return {"web_search_used": needs_web}
+
+    return check_confidence_node
+
+
+def _make_web_search_node(web_search_tool: Any) -> Any:
+    """
+    Create the web search fallback node.
+
+    Calls the web search tool with the question and writes web
+    results into state.  These are combined with any Wikipedia
+    results in the answer node.
+    """
+
+    def web_search_node(state: RAGState) -> dict[str, Any]:
+        question = state["question"]
+
+        with start_span(
+            "graph.web_search_node",
+            attributes={"question": question[:200]},
+        ):
+            try:
+                result = web_search_tool.execute(query=question, max_results=5)
+                web_results = result.get("results", [])
+
+                add_span_attributes(
+                    {
+                        "web_results_count": len(web_results),
+                        "provider": result.get("provider", "unknown"),
+                    }
+                )
+
+                return {"web_results": web_results}
+
+            except Exception as exc:
+                # Web search failure is non-fatal
+                return {
+                    "web_results": [],
+                    "error": f"web_search_node: {type(exc).__name__}: {exc}",
+                }
+
+    return web_search_node
+
+
+def _confidence_router(state: RAGState) -> str:
+    """Route based on whether web search is needed."""
+    if state.get("web_search_used", False):
+        return "low_confidence"
+    return "sufficient"
 
 
 def _make_open_node(
@@ -174,9 +285,9 @@ def _make_answer_node(
     """
     Create the answer node function.
 
-    The node builds a prompt from the opened evidence, calls the
-    language model, extracts citations, and writes the answer +
-    metadata into state.
+    The node builds a prompt from the opened evidence (and optional
+    web search results), calls the language model, extracts citations,
+    and writes the answer + metadata into state.
     """
     gen_settings = generation_settings or {}
 
@@ -185,25 +296,29 @@ def _make_answer_node(
         "You are a helpful research assistant. Answer the user's question "
         "using ONLY the evidence provided below. For each claim, cite the "
         "source by writing [chunk_id] immediately after the claim.\n\n"
+        "If web search results are included, cite them by writing the URL "
+        "in parentheses after the claim.\n\n"
         "If the evidence does not contain enough information, say so honestly."
     )
 
     def answer_node(state: RAGState) -> dict[str, Any]:
         opened_dicts = state.get("opened", [])
+        web_results = state.get("web_results", [])
         question = state["question"]
 
         # If upstream failed, propagate
         if state.get("error"):
             return {}
 
-        # No evidence to answer from
-        if not opened_dicts:
+        # No evidence at all
+        if not opened_dicts and not web_results:
             return {
                 "answer_text": (
                     "I don't have enough evidence in the provided "
                     "articles to fully answer this question."
                 ),
                 "citations": [],
+                "web_citations": [],
                 "tokens_in": 0,
                 "tokens_out": 0,
                 "model_latency_ms": 0.0,
@@ -212,32 +327,54 @@ def _make_answer_node(
 
         with start_span(
             "graph.answer_node",
-            attributes={"evidence_count": len(opened_dicts)},
+            attributes={
+                "evidence_count": len(opened_dicts),
+                "web_results_count": len(web_results),
+            },
         ):
             try:
                 # --- Build prompt ---------------------------------
-                if prompt_builder is not None:
+                if prompt_builder is not None and opened_dicts:
                     messages, meta = prompt_builder.build(
                         "answer_with_citations",
                         question=question,
                         opened_chunks=opened_dicts,
                     )
+                    # Append web results to user message if present
+                    if web_results:
+                        web_block = _format_web_results(web_results)
+                        messages[-1]["content"] += (
+                            f"\n\nAdditional web search results:\n{web_block}"
+                        )
+                        meta["web_results_included"] = len(web_results)
                 else:
-                    # Fallback: inline prompt (parity with old Day-8 loop)
-                    opened_objs = [OpenedChunk(**d) for d in opened_dicts]
-                    evidence_block = format_evidence_block(opened_objs)
+                    # Fallback: inline prompt
+                    evidence_parts: list[str] = []
+
+                    if opened_dicts:
+                        opened_objs = [OpenedChunk(**d) for d in opened_dicts]
+                        evidence_parts.append(
+                            f"Wikipedia evidence:\n{format_evidence_block(opened_objs)}"
+                        )
+
+                    if web_results:
+                        evidence_parts.append(
+                            f"Web search results:\n{_format_web_results(web_results)}"
+                        )
 
                     user_message = (
-                        f"Evidence:\n{evidence_block}\n\n"
-                        f"Question: {question}\n\n"
+                        "\n\n".join(evidence_parts) + f"\n\nQuestion: {question}\n\n"
                         "Answer the question using the evidence above. "
-                        "Cite sources using [chunk_id] notation."
+                        "Cite sources using [chunk_id] for Wikipedia chunks "
+                        "and (URL) for web results."
                     )
                     messages = [
                         {"role": "system", "content": fallback_system},
                         {"role": "user", "content": user_message},
                     ]
                     meta = {"variant": "fallback", "template": "inline"}
+                    if web_results:
+                        meta["web_results_included"] = len(web_results)
 
                 # --- Call model -----------------------------------
                 response = model.generate(messages, **gen_settings)
@@ -246,10 +383,14 @@ def _make_answer_node(
                 known_ids = [d.get("chunk_id", "") for d in opened_dicts]
                 citations = extract_citations(response.text, known_ids)
 
+                known_urls = [r.get("url", "") for r in web_results]
+                web_cites = extract_web_citations(response.text, known_urls)
+
                 add_span_attributes(
                     {
                         "answer_length": len(response.text),
                         "citation_count": len(citations),
+                        "web_citation_count": len(web_cites),
                         "tokens_in": response.tokens_in,
                         "tokens_out": response.tokens_out,
                     }
@@ -258,6 +399,7 @@ def _make_answer_node(
                 return {
                     "answer_text": response.text,
                     "citations": citations,
+                    "web_citations": web_cites,
                     "tokens_in": response.tokens_in,
                     "tokens_out": response.tokens_out,
                     "model_latency_ms": response.latency_ms,
@@ -268,6 +410,7 @@ def _make_answer_node(
                 return {
                     "answer_text": "",
                     "citations": [],
+                    "web_citations": [],
                     "tokens_in": 0,
                     "tokens_out": 0,
                     "model_latency_ms": 0.0,
@@ -276,6 +419,17 @@ def _make_answer_node(
                 }
 
     return answer_node
+
+
+def _format_web_results(results: list[dict[str, Any]]) -> str:
+    """Format web search results into a text block for the prompt."""
+    lines: list[str] = []
+    for i, r in enumerate(results, 1):
+        title = r.get("title", "Untitled")
+        url = r.get("url", "")
+        snippet = r.get("snippet", "")
+        lines.append(f"[Web {i}] {title}\nURL: {url}\n{snippet}")
+    return "\n\n".join(lines)
 
 
 # ------------------------------------------------------------------ #
@@ -291,34 +445,36 @@ def build_rag_graph(
     generation_settings: dict[str, Any] | None = None,
     open_top_n: int = 3,
     search_top_k: int = 5,
+    web_search_tool: Any | None = None,
+    confidence_threshold: int = 2,
 ) -> Any:
     """
-    Build and compile a three-node RAG graph.
+    Build and compile the RAG graph.
 
-    The graph replicates the behaviour of ``ScriptedPolicy`` +
-    ``AgentLoop``:
+    Without ``web_search_tool``::
 
         retrieve  →  open  →  answer  →  END
 
-    All heavy dependencies (tools, model, prompt builder) are captured
-    by closures so the compiled graph is a self-contained callable.
+    With ``web_search_tool``::
+
+        retrieve → check_confidence ──[sufficient]──→ open → answer → END
+                                       │
+                                   [low_confidence]
+                                       │
+                                  web_search → open → answer → END
 
     Args:
-        search_tool:  SearchWikipediaTool (or any ToolSpec with
-                      ``.execute(query=..., top_k=...)``).
-        open_chunk_tool:  OpenChunkTool (or any ToolSpec with
-                          ``.execute(chunk_id=...)``).
+        search_tool:  SearchWikipediaTool or equivalent.
+        open_chunk_tool:  OpenChunkTool or equivalent.
         model:  LanguageModel with ``.generate(messages, **settings)``.
-        prompt_builder:  Optional ``PromptBuilder`` instance.  When
-                         provided, the answer node uses the
-                         ``answer_with_citations`` template.  When
-                         ``None``, a built-in fallback prompt is used.
-        generation_settings:  Extra kwargs forwarded to ``model.generate``
-                              (e.g. temperature, max_tokens).
-        open_top_n:  Default number of retrieved chunks to open.
-                     Can be overridden per-invoke via state.
-        search_top_k:  Default number of chunks to retrieve.
-                       Can be overridden per-invoke via state.
+        prompt_builder:  Optional ``PromptBuilder`` instance.
+        generation_settings:  Extra kwargs for ``model.generate()``.
+        open_top_n:  Default chunks to open.
+        search_top_k:  Default chunks to retrieve.
+        web_search_tool:  Optional ``WebSearchTool`` instance.  When
+            provided, enables the confidence-check + web search fallback.
+        confidence_threshold:  Minimum number of retrieval results
+            needed to skip web search (default 2).
 
     Returns:
         A compiled LangGraph (``CompiledGraph``) ready for ``.invoke()``.
@@ -339,9 +495,33 @@ def build_rag_graph(
         _make_answer_node(model, prompt_builder, generation_settings),
     )
 
-    # --- Wire edges -----------------------------------------------
     builder.set_entry_point("retrieve")
-    builder.add_edge("retrieve", "open")
+
+    if web_search_tool is not None:
+        # --- With web search fallback ---
+        builder.add_node(
+            "check_confidence",
+            _make_check_confidence_node(confidence_threshold),
+        )
+        builder.add_node(
+            "web_search",
+            _make_web_search_node(web_search_tool),
+        )
+
+        builder.add_edge("retrieve", "check_confidence")
+        builder.add_conditional_edges(
+            "check_confidence",
+            _confidence_router,
+            {
+                "sufficient": "open",
+                "low_confidence": "web_search",
+            },
+        )
+        builder.add_edge("web_search", "open")
+    else:
+        # --- Without web search (original Day 3 topology) ---
+        builder.add_edge("retrieve", "open")
+
     builder.add_edge("open", "answer")
     builder.add_edge("answer", END)
 
@@ -422,8 +602,11 @@ def run_rag_graph(
                 "question": question[:200],
                 "answer_length": len(result.get("answer_text", "")),
                 "citation_count": len(result.get("citations", [])),
+                "web_citation_count": len(result.get("web_citations", [])),
                 "retrieved_count": len(result.get("retrieved", [])),
                 "opened_count": len(result.get("opened", [])),
+                "web_search_used": result.get("web_search_used", False),
+                "web_results_count": len(result.get("web_results", [])),
                 "tokens_in": result.get("tokens_in", 0),
                 "tokens_out": result.get("tokens_out", 0),
                 "error": result.get("error"),

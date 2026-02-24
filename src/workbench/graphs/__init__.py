@@ -7,6 +7,7 @@ sequential ``AgentLoop`` with explicit node-and-edge DAGs.
 Graphs
 ------
 rag_graph          — Day 3: search → open → answer (ports ScriptedPolicy)
+                     Day 5: optional web search fallback branch
 researcher_graph   — Day 4: search → open → timeline → answer → validate
                      (ports ResearcherPolicy with stricter citation discipline)
 """
@@ -15,6 +16,7 @@ from workbench.graphs.base_state import RAGState, ResearcherState
 from workbench.graphs.rag_graph import (
     build_rag_graph,
     extract_citations,
+    extract_web_citations,
     run_rag_graph,
 )
 from workbench.graphs.researcher_graph import (
@@ -28,6 +30,7 @@ __all__ = [
     "build_rag_graph",
     "build_researcher_graph",
     "extract_citations",
+    "extract_web_citations",
     "run_rag_graph",
     "run_researcher_graph",
 ]
