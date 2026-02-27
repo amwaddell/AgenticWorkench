@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """
-Preflight check and Phoenix launcher.
+Unified preflight check for the Agentic Workbench.
 
-Verifies everything is ready before you run the researcher eval:
+Verifies that all components are ready to run:
     1. LLM server is reachable
     2. Vector database exists and has data
-    3. Embedding model downloads are cached (triggers download if needed)
-    4. Reranker model downloads are cached
-    5. Phoenix trace viewer is launched
+    3. Embedding model loads successfully
+    4. Reranker model loads successfully
+    5. LangGraph graphs compile (with fakes)
+    6. Streamlit is installed
+    7. Phoenix trace viewer is launched (optional)
 
-NOTE: The embedding model and reranker run in-process, so they must be
-loaded by each script that uses them. However, running this script first
-ensures that model weights are downloaded and cached by HuggingFace,
-so subsequent loads in the eval script will be fast (~1-2s from disk
-instead of a network download).
+Replaces the per-day ``verify_day*.py`` scripts with a single command.
 
 Usage:
     python scripts/preflight.py                # check all + start Phoenix
     python scripts/preflight.py --no-phoenix   # check only
+    python scripts/preflight.py --quick        # skip model downloads
 """
 
 from __future__ import annotations
@@ -32,10 +31,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from workbench.core.config import load_config
 
+# ------------------------------------------------------------------
+# Individual checks
+# ------------------------------------------------------------------
+
 
 def check_llm_server(cfg) -> bool:
     """Verify the LLM server is reachable."""
-    print("[1/4] LLM server...", end=" ", flush=True)
+    print("[1/6] LLM server...", end=" ", flush=True)
     t0 = time.time()
 
     from workbench.models.llamacpp_server import LlamaCppServerModel
@@ -64,7 +67,7 @@ def check_llm_server(cfg) -> bool:
 
 def check_vector_db(cfg) -> bool:
     """Verify LanceDB exists and has chunks."""
-    print("[2/4] Vector database...", end=" ", flush=True)
+    print("[2/6] Vector database...", end=" ", flush=True)
     t0 = time.time()
 
     import lancedb
@@ -91,7 +94,7 @@ def check_vector_db(cfg) -> bool:
 
 def check_embedder(cfg) -> bool:
     """Load embedding model (ensures weights are cached)."""
-    print("[3/4] Embedding model...", end=" ", flush=True)
+    print("[3/6] Embedding model...", end=" ", flush=True)
     t0 = time.time()
 
     from workbench.data_build.embeddings import SentenceTransformerEmbedder
@@ -102,7 +105,6 @@ def check_embedder(cfg) -> bool:
             device=cfg.embeddings.get("device", "mps"),
             batch_size=cfg.embeddings.get("batch_size", 32),
         )
-        # Force model init by embedding a dummy text
         embedder.embed_texts(["preflight check"])
         print(f"OK ({time.time() - t0:.1f}s) — {cfg.embeddings['model_name']}")
         return True
@@ -115,10 +117,10 @@ def check_embedder(cfg) -> bool:
 def check_reranker(cfg) -> bool:
     """Load reranker model (ensures weights are cached)."""
     if not cfg.reranking.get("enabled", True):
-        print("[4/4] Reranker... DISABLED in config, skipping")
+        print("[4/6] Reranker... DISABLED in config, skipping")
         return True
 
-    print("[4/4] Reranker model...", end=" ", flush=True)
+    print("[4/6] Reranker model...", end=" ", flush=True)
     t0 = time.time()
 
     from workbench.retrieval.rerankers import CrossEncoderReranker
@@ -131,6 +133,102 @@ def check_reranker(cfg) -> bool:
         print(f"FAILED ({time.time() - t0:.1f}s)")
         print(f"       {e}")
         return False
+
+
+def check_graphs_compile() -> bool:
+    """Verify that all three graphs compile with fake components."""
+    print("[5/6] Graph compilation...", end=" ", flush=True)
+    t0 = time.time()
+
+    try:
+        from workbench.core.types import ModelResponse
+        from workbench.graphs.rag_graph import build_rag_graph
+        from workbench.graphs.researcher_graph import build_researcher_graph
+        from workbench.graphs.supervisor_graph import build_supervisor_graph
+
+        class FakeSearch:
+            def execute(self, **kw):
+                return {
+                    "chunks": [
+                        {
+                            "chunk_id": "c1",
+                            "score": 0.9,
+                            "title": "T",
+                            "section": "S",
+                            "snippet": "...",
+                        }
+                    ]
+                }
+
+        class FakeOpen:
+            def execute(self, **kw):
+                return {
+                    "found": True,
+                    "chunk": {
+                        "chunk_id": kw.get("chunk_id", "c1"),
+                        "title": "T",
+                        "section": "S",
+                        "text": "Text.",
+                    },
+                    "text_length": 5,
+                }
+
+        class FakeTimeline:
+            def execute(self, **kw):
+                return {
+                    "timeline": [
+                        {"date": "100 BC", "event": "E", "supporting_chunk_ids": ["c1"]}
+                    ],
+                    "raw_model_output": "",
+                    "cited_chunk_ids": ["c1"],
+                }
+
+        class FakeModel:
+            def generate(self, msgs, **kw):
+                return ModelResponse(
+                    text="Answer [c1].", tokens_in=10, tokens_out=5, latency_ms=1.0
+                )
+
+        s, o, m, tl = FakeSearch(), FakeOpen(), FakeModel(), FakeTimeline()
+
+        g1 = build_rag_graph(search_tool=s, open_chunk_tool=o, model=m)
+        g2 = build_researcher_graph(
+            search_tool=s, open_chunk_tool=o, timeline_tool=tl, model=m
+        )
+        g3 = build_supervisor_graph(search_tool=s, open_chunk_tool=o, model=m)
+
+        for g in (g1, g2, g3):
+            assert hasattr(g, "invoke"), "Graph missing invoke()"
+            assert hasattr(g, "stream"), "Graph missing stream()"
+
+        print(
+            f"OK ({time.time() - t0:.1f}s) — rag_graph, researcher_graph, supervisor_graph"
+        )
+        return True
+
+    except Exception as e:
+        print(f"FAILED ({time.time() - t0:.1f}s)")
+        print(f"       {e}")
+        return False
+
+
+def check_streamlit() -> bool:
+    """Verify that Streamlit is importable."""
+    print("[6/6] Streamlit...", end=" ", flush=True)
+    try:
+        import streamlit  # noqa: F401
+
+        print(f"OK — v{streamlit.__version__}")
+        return True
+    except ImportError:
+        print("NOT INSTALLED")
+        print("       → pip install streamlit")
+        return False
+
+
+# ------------------------------------------------------------------
+# Phoenix launcher
+# ------------------------------------------------------------------
 
 
 def start_phoenix() -> subprocess.Popen | None:
@@ -154,29 +252,49 @@ def start_phoenix() -> subprocess.Popen | None:
         return None
 
 
+# ------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------
+
+
 def main():
     parser = argparse.ArgumentParser(description="Preflight check + Phoenix")
     parser.add_argument("--config", type=str, default=None)
-    parser.add_argument("--no-phoenix", action="store_true")
+    parser.add_argument(
+        "--no-phoenix", action="store_true", help="Skip starting Phoenix"
+    )
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Skip model-download checks (embedder, reranker)",
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config) if args.config else None
     cfg = load_config(config_path=config_path)
 
-    print("=" * 50)
-    print("  Preflight checks")
-    print("=" * 50)
+    print("=" * 55)
+    print("  Agentic Workbench — Preflight Checks")
+    print("=" * 55)
     print()
 
     total_t0 = time.time()
-    results = [
-        check_llm_server(cfg),
-        check_vector_db(cfg),
-        check_embedder(cfg),
-        check_reranker(cfg),
-    ]
-    total = time.time() - total_t0
 
+    results = [check_llm_server(cfg), check_vector_db(cfg)]
+
+    if args.quick:
+        print("[3/6] Embedding model... SKIPPED (--quick)")
+        results.append(True)
+        print("[4/6] Reranker... SKIPPED (--quick)")
+        results.append(True)
+    else:
+        results.append(check_embedder(cfg))
+        results.append(check_reranker(cfg))
+
+    results.append(check_graphs_compile())
+    results.append(check_streamlit())
+
+    total = time.time() - total_t0
     passed = sum(results)
     total_checks = len(results)
 
@@ -185,22 +303,31 @@ def main():
         phoenix_proc = start_phoenix()
 
     print()
-    print("=" * 50)
+    print("=" * 55)
     print(f"  {passed}/{total_checks} checks passed ({total:.1f}s)")
 
     if all(results):
-        print("  All systems GO")
+        print("  All systems GO ✅")
     else:
-        print("  Some checks failed — see above")
+        print("  Some checks failed — see above ⚠️")
 
-    print("=" * 50)
+    print("=" * 55)
     print()
 
     if all(results):
-        print("Ready. In another terminal run:")
-        print("  python scripts/run_researcher_eval.py --question-id hist_001")
+        print("Ready to use. Pick one:")
+        print()
+        print("  Chat UI:")
+        print("    bash scripts/run_ui.sh")
+        print()
+        print("  Single question (CLI):")
+        print('    python scripts/run_agent_chat.py "Your question here"')
+        print()
+        print("  Evaluation:")
+        print("    python scripts/run_researcher_eval.py --question-id hist_001")
+        print()
         if phoenix_proc:
-            print("\nPhoenix: http://localhost:6006")
+            print("Phoenix: http://localhost:6006")
             print("Press Ctrl+C to stop Phoenix and exit.\n")
             try:
                 while True:

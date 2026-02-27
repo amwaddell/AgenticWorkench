@@ -57,6 +57,10 @@ source_fetch:
   max_chars: 8000
   user_agent: "AgenticWorkbench/1.0"
 
+# Supervisor settings (Day 7)
+supervisor:
+  routing_mode: "hybrid"            # "hybrid" (default) | "heuristic_only" | "llm_only"
+
 # Data paths
 paths:
   data_dir: "./data"

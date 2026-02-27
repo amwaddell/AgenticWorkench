@@ -92,7 +92,6 @@ def strip_wiki_markup(text: str) -> str:
     text = re.sub(r"<[^>]+>", "", text)
 
     # Remove {{...}} templates (handles simple nesting up to 2 levels)
-    # Two passes catches most nested templates
     for _ in range(2):
         text = re.sub(r"\{\{[^{}]*\}\}", "", text)
 
@@ -168,7 +167,6 @@ def iter_articles_from_dump(dump_path: Path) -> Iterator[dict]:
         source = open(dump_path, encoding="utf-8")
 
     try:
-        # iterparse is memory-efficient — it doesn't load the whole tree
         context = iterparse(source, events=("end",))
 
         page_id = None
@@ -187,8 +185,6 @@ def iter_articles_from_dump(dump_path: Path) -> Iterator[dict]:
                 ns = elem.text or ""
 
             elif tag == _ID and page_id is None:
-                # First <id> inside <page> is the page id;
-                # subsequent ones belong to <revision> — skip those
                 page_id = elem.text or ""
 
             elif tag == _REDIRECT:
@@ -198,7 +194,6 @@ def iter_articles_from_dump(dump_path: Path) -> Iterator[dict]:
                 raw_text = elem.text or ""
 
             elif tag == _PAGE:
-                # End of a <page> — decide whether to yield
                 if ns == "0" and not is_redirect and title and raw_text:
                     cleaned = strip_wiki_markup(raw_text)
                     yield {
@@ -333,136 +328,6 @@ def ingest_wikipedia_dump(
                 "total_chars": total_chars,
                 "skipped": skipped,
                 "duration_s": duration_s,
-            }
-        )
-
-        return {
-            "num_articles": num_articles,
-            "total_chars": total_chars,
-            "skipped": skipped,
-            "output_path": str(output_path),
-            "duration_s": duration_s,
-        }
-
-
-# ---------------------------------------------------------------------------
-# Legacy support: ingest from WikiExtractor output (if you ever need it)
-# ---------------------------------------------------------------------------
-
-_DOC_OPEN_RE = re.compile(
-    r'<doc\s+id="(?P<id>[^"]*)"\s+url="(?P<url>[^"]*)"\s+title="(?P<title>[^"]*)"[^>]*>'
-)
-_DOC_CLOSE = "</doc>"
-
-
-def parse_extracted_file(path: Path) -> Iterator[dict]:
-    """
-    Parse a single WikiExtractor output file.
-
-    Yields one dict per article with keys: page_id, title, url, text.
-    """
-    with open(path, encoding="utf-8") as f:
-        current: dict | None = None
-        text_lines: list[str] = []
-
-        for line in f:
-            match = _DOC_OPEN_RE.match(line)
-            if match:
-                current = {
-                    "page_id": match.group("id"),
-                    "url": match.group("url"),
-                    "title": match.group("title"),
-                }
-                text_lines = []
-                continue
-
-            if line.strip() == _DOC_CLOSE and current is not None:
-                current["text"] = "\n".join(text_lines).strip()
-                yield current
-                current = None
-                text_lines = []
-                continue
-
-            if current is not None:
-                text_lines.append(line.rstrip("\n"))
-
-
-def iter_extracted_dir(extracted_dir: Path) -> Iterator[dict]:
-    """Walk a WikiExtractor output tree and yield every article."""
-    if not extracted_dir.is_dir():
-        raise FileNotFoundError(f"Extracted directory not found: {extracted_dir}")
-
-    for wiki_file in sorted(extracted_dir.rglob("wiki_*")):
-        if wiki_file.is_file():
-            yield from parse_extracted_file(wiki_file)
-
-
-def ingest_wikipedia(
-    extracted_dir: Path,
-    output_path: Path,
-    source_label: str = "simplewiki-latest",
-    *,
-    min_text_length: int = 50,
-) -> dict:
-    """
-    Ingest from WikiExtractor output (legacy path).
-
-    Prefer :func:`ingest_wikipedia_dump` which parses XML directly.
-    """
-    with start_span(
-        "data.ingest_wikipedia",
-        attributes={
-            "extracted_dir": str(extracted_dir),
-            "output_path": str(output_path),
-        },
-    ):
-        t0 = time.time()
-        ingested_at = datetime.now(UTC).isoformat()
-
-        col_page_id: list[str] = []
-        col_title: list[str] = []
-        col_text: list[str] = []
-        col_source: list[str] = []
-        col_ingested: list[str] = []
-        col_text_len: list[int] = []
-        skipped = 0
-
-        for article in iter_extracted_dir(extracted_dir):
-            text = article["text"]
-            if len(text) < min_text_length:
-                skipped += 1
-                continue
-            col_page_id.append(article["page_id"])
-            col_title.append(article["title"])
-            col_text.append(text)
-            col_source.append(source_label)
-            col_ingested.append(ingested_at)
-            col_text_len.append(len(text))
-
-        table = pa.table(
-            {
-                "page_id": pa.array(col_page_id, type=pa.string()),
-                "title": pa.array(col_title, type=pa.string()),
-                "text": pa.array(col_text, type=pa.string()),
-                "source": pa.array(col_source, type=pa.string()),
-                "ingested_at": pa.array(col_ingested, type=pa.string()),
-                "text_length": pa.array(col_text_len, type=pa.int64()),
-            },
-            schema=ARTICLES_SCHEMA,
-        )
-
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(table, output_path)
-
-        duration_s = round(time.time() - t0, 2)
-        num_articles = len(col_page_id)
-        total_chars = sum(col_text_len)
-
-        add_span_attributes(
-            {
-                "num_articles": num_articles,
-                "total_chars": total_chars,
-                "skipped": skipped,
             }
         )
 

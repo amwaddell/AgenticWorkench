@@ -15,6 +15,10 @@ State schemas
     Day 4: extends RAGState with timeline extraction,
     citation validation, and a repair loop.
 
+``SupervisorState``
+    Day 7: extends RAGState with routing metadata and
+    subgraph result aggregation for the supervisor graph.
+
 Both use ``total=False`` so callers only need to provide ``question``
 at invoke time — the rest is populated by graph nodes.
 """
@@ -79,3 +83,34 @@ class ResearcherState(RAGState):
     # --- Citation validation (Day 4) ---------------------------------
     citation_validation: dict[str, Any]  # ValidationResult.to_dict()
     repair_attempts: int
+
+
+class SupervisorState(RAGState):
+    """
+    Extended state for the supervisor (hierarchical) graph.
+
+    Inherits every field from ``RAGState`` and adds routing metadata
+    and subgraph-specific result fields.  The supervisor routes
+    the question to one of several specialist subgraphs, then
+    merges the subgraph result back into this unified state.
+    """
+
+    # --- Routing (Day 7) ---------------------------------------------
+    route: str  # chosen route label: "local_rag", "web_research", etc.
+    router_method: str  # "heuristic" or "llm"
+    router_confidence: float  # 0.0–1.0 confidence in route choice
+    router_rationale: str  # short reason (for logs / debugging)
+    router_latency_ms: float  # time spent in the router node
+
+    # --- Subgraph results (Day 7) ------------------------------------
+    # Timeline fields (populated when researcher subgraph is used)
+    timeline: list[dict[str, Any]]
+    timeline_raw: str
+    citation_validation: dict[str, Any]
+    repair_attempts: int
+
+    # Calculator result (populated when math route is used)
+    calculator_result: dict[str, Any]
+
+    # Subgraph provenance
+    subgraph_used: str  # name of the subgraph that actually ran

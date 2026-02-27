@@ -3,15 +3,19 @@
 Run the historical researcher evaluation.
 
 Iterates over the built-in history question set, runs the researcher
-agent on each question, computes measures, and writes:
+*graph* on each question, computes measures, and writes:
     - per-question Markdown reports  → runs/reports/<run_id>/
     - summary report                 → runs/reports/<run_id>/summary.md
     - raw results JSON               → runs/reports/<run_id>/results.json
+
+This script uses the LangGraph-based ``researcher_graph`` (Day 4+).
+The legacy ``AgentLoop`` + ``ResearcherPolicy`` path has been retired.
 
 Usage:
     python scripts/run_researcher_eval.py
     python scripts/run_researcher_eval.py --questions 5
     python scripts/run_researcher_eval.py --question-id hist_001
+    python scripts/run_researcher_eval.py --system supervisor_graph
 """
 
 from __future__ import annotations
@@ -25,11 +29,12 @@ from pathlib import Path
 # Ensure src/ is on the path when running as a script
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from workbench.stores.chunk_store import ChunkStore
-
-from workbench.agents.loops import AgentLoop
-from workbench.agents.policies import ResearcherPolicy
-from workbench.agents.state import AgentState
+from workbench.agents.state import (
+    AgentState,
+    OpenedChunk,
+    RetrievedChunkSummary,
+    TimelineItem,
+)
 from workbench.core.config import create_config_snapshot, load_config
 from workbench.core.run_context import run_context
 from workbench.data_build.embeddings import SentenceTransformerEmbedder
@@ -40,6 +45,8 @@ from workbench.evaluation.reports import (
     generate_summary_report,
     save_report,
 )
+from workbench.graphs.researcher_graph import build_researcher_graph
+from workbench.graphs.supervisor_graph import build_supervisor_graph
 from workbench.models.llamacpp_server import LlamaCppServerModel
 from workbench.observability.logging import get_logger
 from workbench.observability.phoenix import setup_phoenix_tracing
@@ -49,9 +56,82 @@ from workbench.retrieval.hybrid import HybridRetriever
 from workbench.retrieval.keyword_search import LanceDBKeywordSearcher
 from workbench.retrieval.rerankers import CrossEncoderReranker
 from workbench.retrieval.vector_search import LanceDBVectorSearcher
+from workbench.stores.chunk_store import ChunkStore
 from workbench.tools.open_chunk import OpenChunkTool
 from workbench.tools.search_wikipedia import SearchWikipediaTool
 from workbench.tools.timeline import TimelineTool
+
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+
+
+def _graph_result_to_agent_state(
+    result: dict,
+    question: str,
+) -> AgentState:
+    """
+    Convert a graph result dict to an ``AgentState``.
+
+    The evaluation measures and report generators expect ``AgentState``,
+    but the LangGraph returns a plain dict (``ResearcherState``).
+    This adapter bridges the two.
+    """
+    state = AgentState(question=question)
+
+    # Retrieval stage
+    for r in result.get("retrieved", []):
+        if isinstance(r, dict):
+            state.retrieved.append(
+                RetrievedChunkSummary(
+                    chunk_id=r.get("chunk_id", ""),
+                    score=r.get("score", 0.0),
+                    title=r.get("title", ""),
+                    snippet=r.get("snippet", ""),
+                )
+            )
+
+    # Evidence stage
+    for o in result.get("opened", []):
+        if isinstance(o, dict):
+            state.opened.append(
+                OpenedChunk(
+                    chunk_id=o.get("chunk_id", ""),
+                    document_id=o.get("document_id", ""),
+                    title=o.get("title", ""),
+                    section=o.get("section"),
+                    text=o.get("text", ""),
+                )
+            )
+
+    # Timeline stage
+    for t in result.get("timeline", []):
+        if isinstance(t, dict):
+            state.timeline.append(
+                TimelineItem(
+                    date=t.get("date", ""),
+                    event=t.get("event", ""),
+                    supporting_chunk_ids=t.get("supporting_chunk_ids", []),
+                )
+            )
+        elif isinstance(t, TimelineItem):
+            state.timeline.append(t)
+
+    # Generation stage
+    state.answer_text = result.get("answer_text", "")
+    state.citations = result.get("citations", [])
+    state.tokens_in = result.get("tokens_in", 0)
+    state.tokens_out = result.get("tokens_out", 0)
+    state.model_latency_ms = result.get("model_latency_ms", 0.0)
+    state.done = True
+    state.error = result.get("error")
+
+    return state
+
+
+# ------------------------------------------------------------------
+# Component building
+# ------------------------------------------------------------------
 
 
 def build_components(cfg):
@@ -79,7 +159,6 @@ def build_components(cfg):
     if cfg.reranking.get("enabled", True):
         reranker = CrossEncoderReranker(model_name=cfg.reranking["model_name"])
 
-    # Chunk store — single source of truth for chunk lookups
     chunk_store = ChunkStore(db_path=db_path)
 
     retrieval_cfg = cfg.retrieval
@@ -112,14 +191,54 @@ def build_components(cfg):
     }
 
 
+# ------------------------------------------------------------------
+# Graph building
+# ------------------------------------------------------------------
+
+
+def build_eval_graph(system: str, components: dict, cfg):
+    """Build the evaluation graph for the given system name."""
+    common = dict(
+        search_tool=components["search_tool"],
+        open_chunk_tool=components["open_chunk_tool"],
+        model=components["model"],
+        prompt_builder=components["prompt_builder"],
+    )
+
+    if system == "researcher_graph":
+        return build_researcher_graph(
+            **common,
+            timeline_tool=components["timeline_tool"],
+            generation_settings={"temperature": 0.5, "max_tokens": 2048},
+            open_top_n=5,
+            search_top_k=10,
+        )
+
+    if system == "supervisor_graph":
+        sup_cfg = getattr(cfg, "supervisor", {}) or {}
+        return build_supervisor_graph(
+            **common,
+            timeline_tool=components["timeline_tool"],
+            routing_mode=sup_cfg.get("routing_mode", "hybrid"),
+            open_top_n=5,
+            search_top_k=10,
+        )
+
+    raise ValueError(f"Unknown system: {system!r}")
+
+
+# ------------------------------------------------------------------
+# Run a single question
+# ------------------------------------------------------------------
+
+
 def run_single_question(
     question_data: dict,
-    components: dict,
+    graph: object,
     open_top_n: int = 5,
     search_top_k: int = 10,
-    max_steps: int = 12,
 ) -> dict:
-    """Run the researcher on a single question and return results."""
+    """Run the graph on a single question and return results."""
     question = question_data["question"]
     qid = question_data["id"]
 
@@ -129,33 +248,25 @@ def run_single_question(
 
     t0 = time.time()
 
-    policy = ResearcherPolicy(
-        open_top_n=open_top_n,
-        search_top_k=search_top_k,
-    )
-
-    loop = AgentLoop(
-        policy=policy,
-        search_tool=components["search_tool"],
-        open_chunk_tool=components["open_chunk_tool"],
-        model=components["model"],
-        max_steps=max_steps,
-        prompt_builder=components["prompt_builder"],
-        timeline_tool=components["timeline_tool"],
-        generation_settings={"temperature": 0.5, "max_tokens": 2048},
-    )
-
-    state = AgentState(question=question)
-    state = loop.run(state)
+    # Build initial state and invoke the graph
+    initial_state = {
+        "question": question,
+        "search_top_k": search_top_k,
+        "open_top_n": open_top_n,
+    }
+    result = graph.invoke(initial_state)
 
     total_ms = (time.time() - t0) * 1000
+
+    # Convert graph result → AgentState for measures/reports
+    state = _graph_result_to_agent_state(result, question)
 
     # Compute measures
     metrics = compute_all_measures(state)
     metrics["total_latency_ms"] = round(total_ms, 1)
 
     # Print summary
-    print(f"  Steps: {state.step}")
+    print("  Steps: retrieve → open → timeline → answer → validate")
     print(f"  Citations: {len(state.citations)}")
     print(f"  Timeline items: {len(state.timeline)}")
     print(f"  Total latency: {total_ms:.0f} ms")
@@ -171,6 +282,11 @@ def run_single_question(
         "error": state.error,
         "total_ms": total_ms,
     }
+
+
+# ------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------
 
 
 def main():
@@ -192,6 +308,13 @@ def main():
         type=str,
         default=None,
         help="Path to config YAML",
+    )
+    parser.add_argument(
+        "--system",
+        type=str,
+        default="researcher_graph",
+        choices=["researcher_graph", "supervisor_graph"],
+        help="Which graph system to evaluate (default: researcher_graph)",
     )
     args = parser.parse_args()
 
@@ -215,11 +338,17 @@ def main():
         questions = questions[: args.questions]
 
     print(f"Running evaluation on {len(questions)} questions...")
+    print(f"System: {args.system}")
 
     # Build components once
     print("Building components...")
     components = build_components(cfg)
-    print("Components ready.\n")
+    print("Components ready.")
+
+    # Build graph once
+    print(f"Compiling {args.system}...")
+    graph = build_eval_graph(args.system, components, cfg)
+    print("Graph compiled.\n")
 
     # Run within a traced context
     with run_context(config_snapshot, run_type="evaluation") as ctx:
@@ -235,7 +364,7 @@ def main():
         with start_span("eval.run", attributes={"question_count": len(questions)}):
             for q in questions:
                 try:
-                    result = run_single_question(q, components)
+                    result = run_single_question(q, graph)
                     all_results.append(result)
 
                     # Write per-question report

@@ -1,5 +1,16 @@
 """
-Chatbot system: assemble components and run a question end-to-end.
+Chatbot system (legacy): assemble components and run a question end-to-end.
+
+.. deprecated::
+    Use ``workbench.systems.runner.GraphRunner`` instead::
+
+        from workbench.systems.runner import GraphRunner
+        runner = GraphRunner()
+        result = runner.run("rag_graph", "When did the Roman Republic end?")
+        print(result["answer_text"])
+
+    This module is preserved for backward compatibility but uses the
+    legacy ``AgentLoop`` internally.  It will not receive new features.
 
 This is the top-level entry point that:
     1. Loads configuration
@@ -7,14 +18,6 @@ This is the top-level entry point that:
     3. Wires them into an agent loop
     4. Runs a single question within a traced run context
     5. Returns the final agent state (answer + citations + metrics)
-
-Usage:
-    from workbench.systems.chatbot import ChatbotSystem
-
-    system = ChatbotSystem()               # uses defaults.yaml
-    result = system.ask("When did the Roman Republic end?")
-    print(result.answer_text)
-    print(result.citations)
 """
 
 from __future__ import annotations
@@ -49,6 +52,10 @@ from workbench.tools.search_wikipedia import SearchWikipediaTool
 class ChatbotSystem:
     """
     Fully assembled chatbot: retrieval + reranking + LLM generation.
+
+    .. deprecated::
+        Use ``GraphRunner`` from ``workbench.systems.runner`` instead.
+        This class uses the legacy ``AgentLoop`` and will not be updated.
 
     All components are built lazily on first ``ask()`` call so you can
     create the object cheaply and only pay for initialisation when needed.
@@ -150,6 +157,9 @@ class ChatbotSystem:
     ) -> AgentState:
         """
         Ask a question and get an answer with citations.
+
+        .. deprecated::
+            Use ``GraphRunner().run("rag_graph", question)`` instead.
 
         Args:
             question: The user's question.
