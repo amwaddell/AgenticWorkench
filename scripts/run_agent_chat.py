@@ -4,49 +4,68 @@ Run the agent chatbot from the command line.
 
 Usage:
     python scripts/run_agent_chat.py "When did the Roman Republic end?"
-    python scripts/run_agent_chat.py "How does photosynthesis work?"
+    python scripts/run_agent_chat.py --graph researcher_graph "Timeline of the fall of Rome"
 
 Prerequisites:
     1. LanceDB indexes built (vector + keyword FTS)
     2. Local model server running: bash scripts/start_model_server.sh
 """
 
-import sys
+import argparse
 
-from workbench.systems.chatbot import ChatbotSystem
+from workbench.systems.runner import GraphRunner
 
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        print('Usage: python scripts/run_agent_chat.py "<your question>"')
-        raise SystemExit(1)
+    parser = argparse.ArgumentParser(description="Run agent chatbot")
+    parser.add_argument("question", nargs="+", help="Question to ask")
+    parser.add_argument(
+        "--graph",
+        default="rag_graph",
+        choices=["rag_graph", "researcher_graph", "supervisor_graph"],
+        help="Which graph to run (default: rag_graph)",
+    )
+    args = parser.parse_args()
 
-    question = " ".join(sys.argv[1:])
-    print(f"Question: {question}\n")
+    question = " ".join(args.question)
+    graph_name = args.graph
 
-    system = ChatbotSystem()
-    state = system.ask(question)
+    print(f"Question: {question}")
+    print(f"Graph:    {graph_name}\n")
+
+    runner = GraphRunner()
+    result = runner.run(graph_name, question)
 
     # Print results
     print("\n" + "=" * 60)
 
-    if state.error:
-        print(f"ERROR: {state.error}")
+    if result.get("error"):
+        print(f"ERROR: {result['error']}")
     else:
-        print(f"Answer:\n{state.answer_text}")
+        print(f"Answer:\n{result.get('answer_text', '(no answer)')}")
 
     print("\n--- Metadata ---")
-    print(f"  Steps:          {state.step}")
-    print(f"  Retrieved:      {len(state.retrieved)} chunks")
-    print(f"  Opened:         {len(state.opened)} chunks")
-    print(f"  Citations:      {state.citations}")
-    print(f"  Tokens in/out:  {state.tokens_in} / {state.tokens_out}")
-    print(f"  Model latency:  {state.model_latency_ms:.0f} ms")
+    print(f"  Retrieved:      {len(result.get('retrieved', []))} chunks")
+    print(f"  Opened:         {len(result.get('opened', []))} chunks")
+    print(f"  Citations:      {result.get('citations', [])}")
+    print(
+        f"  Tokens in/out:  {result.get('tokens_in', 0)} / {result.get('tokens_out', 0)}"
+    )
+    print(f"  Model latency:  {result.get('model_latency_ms', 0):.0f} ms")
 
-    if state.opened:
+    if result.get("timeline"):
+        print(f"\n--- Timeline ({len(result['timeline'])} events) ---")
+        for item in result["timeline"]:
+            date = item.get("date", "?")
+            event = item.get("event", "?")
+            print(f"  {date}: {event}")
+
+    if result.get("opened"):
         print("\n--- Evidence used ---")
-        for chunk in state.opened:
-            print(f"  [{chunk.chunk_id}] {chunk.title}")
+        for chunk in result["opened"]:
+            cid = chunk.get("chunk_id", "?")
+            title = chunk.get("title", "?")
+            print(f"  [{cid}] {title}")
 
 
 if __name__ == "__main__":

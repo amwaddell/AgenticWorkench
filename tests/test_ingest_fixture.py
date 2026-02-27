@@ -1,12 +1,11 @@
 """
 Tests for Wikipedia ingestion.
 
-Tests the direct XML dump parser (primary path) and the legacy
-WikiExtractor parser.  Uses small fixture files — no real dump needed.
+Tests the direct XML dump parser (primary path).
+Uses small fixture files — no real dump needed.
 
 Fixtures:
-    tests/fixtures/simplewiki_sample.xml       — tiny MediaWiki XML dump
-    tests/fixtures/wikipedia_extracted_sample.txt — WikiExtractor <doc> format
+    tests/fixtures/simplewiki_sample.xml — tiny MediaWiki XML dump
 """
 
 from pathlib import Path
@@ -15,11 +14,8 @@ import pyarrow.parquet as pq
 import pytest
 
 from workbench.data_build.ingest_wikipedia import (
-    ingest_wikipedia,
     ingest_wikipedia_dump,
     iter_articles_from_dump,
-    iter_extracted_dir,
-    parse_extracted_file,
     strip_wiki_markup,
 )
 
@@ -29,7 +25,6 @@ from workbench.data_build.ingest_wikipedia import (
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 XML_FIXTURE = FIXTURES_DIR / "simplewiki_sample.xml"
-WIKIEXTRACTOR_FIXTURE = FIXTURES_DIR / "wikipedia_extracted_sample.txt"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -113,8 +108,6 @@ class TestIterArticlesFromDump:
     def test_yields_main_articles_only(self):
         """Should skip redirects (page 100) and talk pages (ns=1)."""
         articles = list(iter_articles_from_dump(XML_FIXTURE))
-        # 6 pages total: 3 real articles + 1 stub + 1 redirect + 1 talk
-        # Parser yields ns=0 non-redirects = 4 (including stub)
         titles = [a["title"] for a in articles]
         assert "Anarchism" in titles
         assert "Autism" in titles
@@ -229,65 +222,3 @@ class TestIngestWikipediaDump:
         table_b = pq.read_table(out_b)
         for col in ("page_id", "title", "text", "source", "text_length"):
             assert table_a.column(col).to_pylist() == table_b.column(col).to_pylist()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Legacy WikiExtractor parser (parse_extracted_file / ingest_wikipedia)
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class TestParseExtractedFile:
-    """Tests for the WikiExtractor <doc> format parser."""
-
-    def test_parses_all_articles(self):
-        articles = list(parse_extracted_file(WIKIEXTRACTOR_FIXTURE))
-        assert len(articles) == 4
-
-    def test_fields_present(self):
-        for article in parse_extracted_file(WIKIEXTRACTOR_FIXTURE):
-            assert "page_id" in article
-            assert "title" in article
-            assert "url" in article
-            assert "text" in article
-
-    def test_titles_non_empty(self):
-        for article in parse_extracted_file(WIKIEXTRACTOR_FIXTURE):
-            assert len(article["title"]) > 0
-
-    def test_page_ids(self):
-        ids = [a["page_id"] for a in parse_extracted_file(WIKIEXTRACTOR_FIXTURE)]
-        assert ids == ["12", "25", "39", "99"]
-
-
-class TestIterExtractedDir:
-    def test_walks_fixture_dir(self, tmp_path):
-        subdir = tmp_path / "AA"
-        subdir.mkdir()
-        (subdir / "wiki_00").write_text(WIKIEXTRACTOR_FIXTURE.read_text())
-        articles = list(iter_extracted_dir(tmp_path))
-        assert len(articles) == 4
-
-    def test_missing_dir_raises(self):
-        with pytest.raises(FileNotFoundError):
-            list(iter_extracted_dir(Path("/nonexistent/path")))
-
-
-class TestIngestWikipediaLegacy:
-    def _setup_extracted_dir(self, tmp_path: Path) -> Path:
-        extracted = tmp_path / "extracted" / "AA"
-        extracted.mkdir(parents=True)
-        (extracted / "wiki_00").write_text(WIKIEXTRACTOR_FIXTURE.read_text())
-        return tmp_path / "extracted"
-
-    def test_creates_parquet(self, tmp_path):
-        extracted = self._setup_extracted_dir(tmp_path)
-        output = tmp_path / "articles.parquet"
-        ingest_wikipedia(extracted, output)
-        assert output.exists()
-
-    def test_correct_row_count(self, tmp_path):
-        extracted = self._setup_extracted_dir(tmp_path)
-        output = tmp_path / "articles.parquet"
-        summary = ingest_wikipedia(extracted, output, min_text_length=50)
-        assert summary["num_articles"] == 3
-        assert summary["skipped"] == 1

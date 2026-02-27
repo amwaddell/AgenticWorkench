@@ -5,9 +5,7 @@ Agent state and types.
 ``RetrievedChunkSummary``, ``TimelineItem``) are the primary exports
 of this package and are used throughout the codebase.
 
-Legacy orchestration (``AgentLoop``, policies) is still importable
-from ``workbench.agents.loops`` and ``workbench.agents.policies``,
-but new code should use the LangGraph graphs in ``workbench.graphs``.
+Orchestration is handled by the LangGraph graphs in ``workbench.graphs``.
 """
 
 from workbench.agents.state import (
