@@ -10,6 +10,8 @@ State schemas
 ``RAGState``
     Day 3: basic search → open → answer.
     Day 5: adds optional web search fallback fields.
+    Day 9: adds multi-turn chat fields (chat_history,
+    conversation_summary, rewritten_query).
 
 ``ResearcherState``
     Day 4: extends RAGState with timeline extraction,
@@ -28,6 +30,13 @@ from __future__ import annotations
 from typing import Any, TypedDict
 
 
+class ChatMessage(TypedDict, total=False):
+    """A single turn in conversation history."""
+
+    role: str  # "user" or "assistant"
+    content: str
+
+
 class RAGState(TypedDict, total=False):
     """
     State schema for the basic RAG graph.
@@ -40,6 +49,11 @@ class RAGState(TypedDict, total=False):
 
     # --- Input --------------------------------------------------------
     question: str
+
+    # --- Multi-turn chat (Day 9) --------------------------------------
+    chat_history: list[ChatMessage]  # recent turns (user+assistant pairs)
+    conversation_summary: str  # rolling summary of older turns
+    rewritten_query: str  # standalone query after coreference resolution
 
     # --- Retrieval control (overridable per-invoke) -------------------
     search_top_k: int

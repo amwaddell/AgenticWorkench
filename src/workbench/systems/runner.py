@@ -21,6 +21,19 @@ Usage::
     result = runner.run("researcher_graph", "When did the Roman Republic end?")
     print(result["answer_text"])
 
+Usage (multi-turn chat)::
+
+    runner = GraphRunner()
+    result = runner.run(
+        "rag_graph",
+        "What was that battle about?",
+        chat_history=[
+            {"role": "user", "content": "Tell me about WW2"},
+            {"role": "assistant", "content": "World War II was..."},
+        ],
+        conversation_summary="Discussing WW2 and the Eastern Front.",
+    )
+
 Or as a one-liner::
 
     from workbench.systems.runner import run_graph
@@ -336,6 +349,8 @@ class GraphRunner:
         *,
         search_top_k: int | None = None,
         open_top_n: int | None = None,
+        chat_history: list[dict[str, str]] | None = None,
+        conversation_summary: str | None = None,
         run_type: str | None = None,
         **graph_overrides: Any,
     ) -> dict[str, Any]:
@@ -347,6 +362,11 @@ class GraphRunner:
             question: The user's question.
             search_top_k: Override default retrieval count.
             open_top_n: Override default open count.
+            chat_history: Recent conversation turns for multi-turn chat.
+                          Each turn is ``{"role": "user"|"assistant",
+                          "content": "..."}``.
+            conversation_summary: Rolling summary of older conversation
+                                  turns (used alongside chat_history).
             run_type: Label for the run context (default: ``graph_name``).
             **graph_overrides: Forwarded to ``build_graph()``.
 
@@ -378,6 +398,10 @@ class GraphRunner:
                     initial_state["search_top_k"] = search_top_k
                 if open_top_n is not None:
                     initial_state["open_top_n"] = open_top_n
+                if chat_history is not None:
+                    initial_state["chat_history"] = chat_history
+                if conversation_summary is not None:
+                    initial_state["conversation_summary"] = conversation_summary
 
                 result: dict[str, Any] = graph.invoke(initial_state)
                 total_ms = (time.time() - t0) * 1000
@@ -387,11 +411,13 @@ class GraphRunner:
                 f"{graph_name}_completed",
                 {
                     "question": question[:200],
+                    "rewritten_query": result.get("rewritten_query", "")[:200],
                     "answer_length": len(result.get("answer_text", "")),
                     "citation_count": len(result.get("citations", [])),
                     "retrieved_count": len(result.get("retrieved", [])),
                     "opened_count": len(result.get("opened", [])),
                     "timeline_count": len(result.get("timeline", [])),
+                    "chat_turns": len(chat_history) if chat_history else 0,
                     "tokens_in": result.get("tokens_in", 0),
                     "tokens_out": result.get("tokens_out", 0),
                     "error": result.get("error"),
@@ -401,7 +427,7 @@ class GraphRunner:
 
             if result.get("retrieved"):
                 logger.log_retrieval(
-                    query=question,
+                    query=result.get("rewritten_query", question),
                     num_results=len(result["retrieved"]),
                     retrieval_method="hybrid",
                     duration_ms=total_ms,
@@ -434,7 +460,7 @@ class GraphRunner:
 
             metrics.record_retrieval(
                 final_count=len(result.get("opened", [])),
-                query=question,
+                query=result.get("rewritten_query", question),
                 keyword_candidates=len(result.get("retrieved", [])),
                 vector_candidates=len(result.get("retrieved", [])),
                 reranked=len(result.get("retrieved", [])),
@@ -456,6 +482,8 @@ def run_graph(
     *,
     config_path: Path | None = None,
     config_overrides: dict[str, Any] | None = None,
+    chat_history: list[dict[str, str]] | None = None,
+    conversation_summary: str | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
     """
@@ -466,6 +494,8 @@ def run_graph(
         question: The user's question.
         config_path: Optional config file path.
         config_overrides: Optional config overrides.
+        chat_history: Optional conversation history for multi-turn.
+        conversation_summary: Optional rolling summary.
         **kwargs: Forwarded to ``GraphRunner.run()``.
 
     Returns:
@@ -475,4 +505,10 @@ def run_graph(
         config_path=config_path,
         config_overrides=config_overrides,
     )
-    return runner.run(graph_name, question, **kwargs)
+    return runner.run(
+        graph_name,
+        question,
+        chat_history=chat_history,
+        conversation_summary=conversation_summary,
+        **kwargs,
+    )

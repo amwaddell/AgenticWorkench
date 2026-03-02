@@ -22,8 +22,19 @@ Usage (new build API — returns messages + metadata)::
         question="When did Rome fall?",
         opened_chunks=opened,          # list[OpenedChunk] or list[dict]
     )
-    # meta = {"variant": "answer_with_citations", "template": "...",
-    #         "version": "v-...", "evidence_count": 3, ...}
+
+Usage (chat-aware build — includes conversation context)::
+
+    messages, meta = pb.build(
+        "chat_answer_with_citations",
+        question="What was that battle about?",
+        opened_chunks=opened,
+        chat_history=[
+            {"role": "user", "content": "Tell me about WW2"},
+            {"role": "assistant", "content": "World War II was..."},
+        ],
+        conversation_summary="Discussing WW2, specifically Stalingrad.",
+    )
 """
 
 from __future__ import annotations
@@ -36,6 +47,9 @@ from workbench.agents.state import OpenedChunk, TimelineItem
 
 # Default templates directory — next to this file
 _DEFAULT_TEMPLATES_DIR = Path(__file__).parent / "templates"
+
+# Maximum recent turns to include in conversation context block
+_MAX_CONTEXT_TURNS = 8  # 4 user + 4 assistant
 
 
 def _hash_template(text: str) -> str:
@@ -124,6 +138,8 @@ class PromptBuilder:
         opened_chunks: list[OpenedChunk] | list[dict[str, Any]],
         timeline: list[TimelineItem] | list[dict[str, Any]] | None = None,
         extra_instructions: str | None = None,
+        chat_history: list[dict[str, str]] | None = None,
+        conversation_summary: str | None = None,
     ) -> tuple[list[dict[str, str]], dict[str, Any]]:
         """
         Build prompt messages and metadata for a given template variant.
@@ -136,7 +152,8 @@ class PromptBuilder:
         for observability.
 
         Args:
-            variant:  Template name (e.g. ``"answer_with_citations"``).
+            variant:  Template name (e.g. ``"answer_with_citations"``
+                      or ``"chat_answer_with_citations"``).
             question:  The user question.
             opened_chunks:  Evidence chunks — accepts ``OpenedChunk``
                             Pydantic objects **or** plain dicts (as
@@ -147,6 +164,12 @@ class PromptBuilder:
             extra_instructions:  Optional text prepended to the rendered
                                  prompt (for prompt variants without a
                                  new template file).
+            chat_history:  Optional list of recent conversation turns.
+                           Each turn is ``{"role": "user"|"assistant",
+                           "content": "..."}`` .  Used by chat-aware
+                           templates.
+            conversation_summary:  Optional rolling summary of older
+                                   conversation turns.
 
         Returns:
             ``(messages, meta)`` where:
@@ -172,16 +195,28 @@ class PromptBuilder:
                 else:
                     normalised_timeline.append(t)
 
+        # --- Build conversation context block -----------------------
+        conversation_context = format_conversation_context(
+            chat_history=chat_history,
+            conversation_summary=conversation_summary,
+        )
+
         # --- Render -------------------------------------------------
         evidence = format_evidence_block(normalised_chunks)
         timeline_section = format_timeline_section(normalised_timeline)
 
-        user_prompt = self.render(
-            variant,
-            question=question,
-            evidence=evidence,
-            timeline_section=timeline_section,
-        )
+        # Build the kwargs for the template — include conversation
+        # context for chat-aware templates, and provide it as empty
+        # string for non-chat templates so {conversation_context}
+        # can be safely omitted or included.
+        render_kwargs: dict[str, Any] = {
+            "question": question,
+            "evidence": evidence,
+            "timeline_section": timeline_section,
+            "conversation_context": conversation_context,
+        }
+
+        user_prompt = self.render(variant, **render_kwargs)
 
         if extra_instructions:
             user_prompt = f"{extra_instructions}\n\n{user_prompt}"
@@ -194,6 +229,8 @@ class PromptBuilder:
             "version": self.get_version(variant),
             "evidence_count": len(normalised_chunks),
             "timeline_count": len(normalised_timeline),
+            "chat_turns": len(chat_history) if chat_history else 0,
+            "has_summary": bool(conversation_summary),
         }
 
         return messages, meta
@@ -248,3 +285,50 @@ def format_timeline_section(timeline: list[TimelineItem]) -> str:
         lines.append(f"• {item.date}: {item.event}  [{chunk_refs}]")
     lines.append("")  # trailing newline
     return "\n".join(lines)
+
+
+def format_conversation_context(
+    chat_history: list[dict[str, str]] | None = None,
+    conversation_summary: str | None = None,
+    max_turns: int = _MAX_CONTEXT_TURNS,
+) -> str:
+    """
+    Format conversation history into a context block for prompts.
+
+    Combines a rolling summary (of older turns) with the most recent
+    turns to give the model enough context for coreference resolution
+    and conversational coherence.
+
+    Args:
+        chat_history:  Recent conversation turns.  Each is
+                       ``{"role": ..., "content": ...}``.
+        conversation_summary:  Rolling summary of older turns that
+                               have been evicted from ``chat_history``.
+        max_turns:  Maximum number of recent turns to include.
+
+    Returns:
+        Formatted context block, or empty string if no history.
+    """
+    if not chat_history and not conversation_summary:
+        return ""
+
+    parts: list[str] = ["--- CONVERSATION CONTEXT ---"]
+
+    if conversation_summary:
+        parts.append(f"Summary of earlier discussion: {conversation_summary}")
+        parts.append("")
+
+    if chat_history:
+        # Take the most recent turns
+        recent = chat_history[-max_turns:]
+        parts.append("Recent conversation:")
+        for turn in recent:
+            role = turn.get("role", "user").capitalize()
+            content = turn.get("content", "")
+            # Truncate very long assistant responses for context
+            if role == "Assistant" and len(content) > 500:
+                content = content[:500] + "…"
+            parts.append(f"{role}: {content}")
+        parts.append("")  # trailing newline
+
+    return "\n".join(parts)

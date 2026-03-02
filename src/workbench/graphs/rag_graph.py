@@ -10,46 +10,43 @@ adds a confidence-check node after retrieval.  If retrieval returns
 fewer results than ``confidence_threshold``, the graph branches to
 a web search node before proceeding to the answer.
 
-Topology (without web search)::
+**Day 9 addition**: multi-turn chat support.  When ``chat_history``
+is present in the initial state, the graph inserts a ``rewrite_query``
+node before retrieval to resolve coreferences (e.g. "that battle" →
+"the Battle of Stalingrad").  The answer node also receives
+conversation context so the LLM can produce coherent follow-up replies.
+
+Topology (single-turn, no web search)::
 
     retrieve  →  open  →  answer  →  END
 
-Topology (with web search)::
+Topology (multi-turn, no web search)::
 
-    retrieve → check_confidence ──[sufficient]──→ open → answer → END
-                                   │
-                               [low_confidence]
-                                   │
-                              web_search → open → answer → END
+    rewrite_query  →  retrieve  →  open  →  answer  →  END
 
-Usage (standalone)::
+Topology (multi-turn, with web search)::
 
-    graph = build_rag_graph(
-        search_tool=search_tool,
-        open_chunk_tool=open_chunk_tool,
-        model=llm,
-        prompt_builder=PromptBuilder(),
-    )
+    rewrite_query → retrieve → check_confidence ─[sufficient]─→ open → answer → END
+                                                  │
+                                              [low_confidence]
+                                                  │
+                                             web_search → open → answer → END
+
+Usage (single-turn — backward compatible)::
+
+    graph = build_rag_graph(search_tool, open_chunk_tool, model)
     result = graph.invoke({"question": "When did the Roman Republic end?"})
-    print(result["answer_text"])
 
-Usage (with web search fallback)::
+Usage (multi-turn chat)::
 
-    graph = build_rag_graph(
-        search_tool=search_tool,
-        open_chunk_tool=open_chunk_tool,
-        model=llm,
-        web_search_tool=WebSearchTool(),
-        confidence_threshold=2,
-    )
-
-Usage (with observability)::
-
-    result = run_rag_graph(
-        graph=graph,
-        question="When did the Roman Republic end?",
-        config_snapshot=snapshot,
-    )
+    result = graph.invoke({
+        "question": "What was that battle about?",
+        "chat_history": [
+            {"role": "user", "content": "Tell me about WW2"},
+            {"role": "assistant", "content": "World War II was a global conflict..."},
+        ],
+        "conversation_summary": "Discussing WW2 and the Eastern Front.",
+    })
 """
 
 from __future__ import annotations
@@ -64,6 +61,7 @@ from workbench.graphs.base_state import RAGState
 from workbench.observability.tracing import add_span_attributes, start_span
 from workbench.prompting.prompt_builder import (
     PromptBuilder,
+    format_conversation_context,
     format_evidence_block,
 )
 
@@ -119,6 +117,100 @@ def extract_web_citations(answer_text: str, urls: list[str]) -> list[str]:
 # ------------------------------------------------------------------ #
 
 
+def _make_rewrite_query_node(
+    model: Any,
+    prompt_builder: PromptBuilder | None,
+    generation_settings: dict[str, Any] | None,
+) -> Any:
+    """
+    Create the query rewrite node for multi-turn conversations.
+
+    When ``chat_history`` is present in state, this node calls the LLM
+    to resolve coreferences and produce a standalone search query.
+
+    When there is no chat history (first turn), the node passes the
+    original question through unchanged.
+    """
+    gen_settings = generation_settings or {"temperature": 0.1, "max_tokens": 100}
+
+    # Fallback prompt for when no PromptBuilder is available
+    _FALLBACK_REWRITE_PROMPT = (
+        "Rewrite the following question as a standalone search query, "
+        "resolving any pronouns or references using the conversation context. "
+        "Output ONLY the rewritten query.\n\n"
+        "{conversation_context}\n"
+        "Latest question: {question}\n\n"
+        "Standalone query:"
+    )
+
+    def rewrite_query_node(state: RAGState) -> dict[str, Any]:
+        chat_history = state.get("chat_history", [])
+        conversation_summary = state.get("conversation_summary", "")
+        question = state["question"]
+
+        # No history → skip rewrite, use original question
+        if not chat_history:
+            return {"rewritten_query": question}
+
+        with start_span(
+            "graph.rewrite_query_node",
+            attributes={
+                "question": question[:200],
+                "chat_turns": len(chat_history),
+                "has_summary": bool(conversation_summary),
+            },
+        ):
+            try:
+                conversation_context = format_conversation_context(
+                    chat_history=chat_history,
+                    conversation_summary=conversation_summary,
+                )
+
+                if prompt_builder is not None:
+                    try:
+                        user_prompt = prompt_builder.render(
+                            "chat_query_rewrite",
+                            question=question,
+                            conversation_context=conversation_context,
+                        )
+                    except FileNotFoundError:
+                        # Template not found — use fallback
+                        user_prompt = _FALLBACK_REWRITE_PROMPT.format(
+                            question=question,
+                            conversation_context=conversation_context,
+                        )
+                else:
+                    user_prompt = _FALLBACK_REWRITE_PROMPT.format(
+                        question=question,
+                        conversation_context=conversation_context,
+                    )
+
+                messages = [{"role": "user", "content": user_prompt}]
+                response = model.generate(messages, **gen_settings)
+
+                rewritten = response.text.strip()
+                # Safety: if the model returns something empty or too long,
+                # fall back to original question
+                if not rewritten or len(rewritten) > 300:
+                    rewritten = question
+
+                add_span_attributes(
+                    {
+                        "rewritten_query": rewritten[:200],
+                        "original_question": question[:200],
+                    }
+                )
+
+                return {"rewritten_query": rewritten}
+
+            except Exception as exc:
+                # Rewrite failure is non-fatal — use original question
+                add_span_attributes({"rewrite_error": str(exc)[:200]})
+                return {"rewritten_query": question}
+
+    return rewrite_query_node
+
+
 def _make_retrieve_node(
     search_tool: Any,
     default_top_k: int,
@@ -128,18 +220,22 @@ def _make_retrieve_node(
 
     The node calls ``search_tool.execute()`` with the question and
     writes the result into ``state["retrieved"]``.
+
+    In multi-turn mode, uses ``rewritten_query`` instead of the raw
+    ``question`` for retrieval.
     """
 
     def retrieve_node(state: RAGState) -> dict[str, Any]:
-        question = state["question"]
+        # Prefer the rewritten query (from rewrite node) over raw question
+        query = state.get("rewritten_query") or state["question"]
         top_k = state.get("search_top_k", default_top_k)
 
         with start_span(
             "graph.retrieve_node",
-            attributes={"question": question[:200], "top_k": top_k},
+            attributes={"question": query[:200], "top_k": top_k},
         ):
             try:
-                result = search_tool.execute(query=question, top_k=top_k)
+                result = search_tool.execute(query=query, top_k=top_k)
                 chunks = result.get("chunks", [])
 
                 add_span_attributes({"results_count": len(chunks)})
@@ -189,17 +285,20 @@ def _make_web_search_node(web_search_tool: Any) -> Any:
     Calls the web search tool with the question and writes web
     results into state.  These are combined with any Wikipedia
     results in the answer node.
+
+    In multi-turn mode, uses ``rewritten_query`` for better web search.
     """
 
     def web_search_node(state: RAGState) -> dict[str, Any]:
-        question = state["question"]
+        # Use rewritten query for web search too
+        query = state.get("rewritten_query") or state["question"]
 
         with start_span(
             "graph.web_search_node",
-            attributes={"question": question[:200]},
+            attributes={"question": query[:200]},
         ):
             try:
-                result = web_search_tool.execute(query=question, max_results=5)
+                result = web_search_tool.execute(query=query, max_results=5)
                 web_results = result.get("results", [])
 
                 add_span_attributes(
@@ -288,6 +387,9 @@ def _make_answer_node(
     The node builds a prompt from the opened evidence (and optional
     web search results), calls the language model, extracts citations,
     and writes the answer + metadata into state.
+
+    In multi-turn mode, includes conversation context in the prompt
+    so the LLM can produce coherent follow-up replies.
     """
     gen_settings = generation_settings or {}
 
@@ -305,6 +407,8 @@ def _make_answer_node(
         opened_dicts = state.get("opened", [])
         web_results = state.get("web_results", [])
         question = state["question"]
+        chat_history = state.get("chat_history", [])
+        conversation_summary = state.get("conversation_summary", "")
 
         # If upstream failed, propagate
         if state.get("error"):
@@ -330,16 +434,41 @@ def _make_answer_node(
             attributes={
                 "evidence_count": len(opened_dicts),
                 "web_results_count": len(web_results),
+                "chat_turns": len(chat_history),
             },
         ):
             try:
-                # --- Build prompt ---------------------------------
+                # --- Choose template variant ----------------------
+                has_history = bool(chat_history)
+
                 if prompt_builder is not None and opened_dicts:
-                    messages, meta = prompt_builder.build(
-                        "answer_with_citations",
-                        question=question,
-                        opened_chunks=opened_dicts,
-                    )
+                    # Pick chat-aware template if we have history
+                    if has_history:
+                        try:
+                            variant = "chat_answer_with_citations"
+                            messages, meta = prompt_builder.build(
+                                variant,
+                                question=question,
+                                opened_chunks=opened_dicts,
+                                chat_history=chat_history,
+                                conversation_summary=conversation_summary,
+                            )
+                        except FileNotFoundError:
+                            # Chat template not installed — fall back
+                            variant = "answer_with_citations"
+                            messages, meta = prompt_builder.build(
+                                variant,
+                                question=question,
+                                opened_chunks=opened_dicts,
+                            )
+                    else:
+                        variant = "answer_with_citations"
+                        messages, meta = prompt_builder.build(
+                            variant,
+                            question=question,
+                            opened_chunks=opened_dicts,
+                        )
+
                     # Append web results to user message if present
                     if web_results:
                         web_block = _format_web_results(web_results)
@@ -361,6 +490,14 @@ def _make_answer_node(
                         evidence_parts.append(
                             f"Web search results:\n{_format_web_results(web_results)}"
                         )
+
+                    # Include conversation context in fallback too
+                    if has_history:
+                        conv_ctx = format_conversation_context(
+                            chat_history=chat_history,
+                            conversation_summary=conversation_summary,
+                        )
+                        evidence_parts.insert(0, conv_ctx)
 
                     user_message = (
                         "\n\n".join(evidence_parts) + f"\n\nQuestion: {question}\n\n"
@@ -451,17 +588,22 @@ def build_rag_graph(
     """
     Build and compile the RAG graph.
 
+    The graph always includes a ``rewrite_query`` node as the entry
+    point.  On the first turn (no ``chat_history``), the rewrite node
+    is a no-op that copies ``question`` → ``rewritten_query``.  On
+    follow-up turns, it calls the LLM to resolve coreferences.
+
     Without ``web_search_tool``::
 
-        retrieve  →  open  →  answer  →  END
+        rewrite_query → retrieve → open → answer → END
 
     With ``web_search_tool``::
 
-        retrieve → check_confidence ──[sufficient]──→ open → answer → END
-                                       │
-                                   [low_confidence]
-                                       │
-                                  web_search → open → answer → END
+        rewrite_query → retrieve → check_confidence ─[sufficient]─→ open → answer → END
+                                                      │
+                                                  [low_confidence]
+                                                      │
+                                                 web_search → open → answer → END
 
     Args:
         search_tool:  SearchWikipediaTool or equivalent.
@@ -477,11 +619,16 @@ def build_rag_graph(
             needed to skip web search (default 2).
 
     Returns:
-        A compiled LangGraph (``CompiledGraph``) ready for ``.invoke()``.
+        A compiled LangGraph (``CompiledGraph``) ready for ``.invoke()``
+        or ``.stream()``.
     """
     builder: StateGraph = StateGraph(RAGState)
 
     # --- Register nodes -------------------------------------------
+    builder.add_node(
+        "rewrite_query",
+        _make_rewrite_query_node(model, prompt_builder, generation_settings),
+    )
     builder.add_node(
         "retrieve",
         _make_retrieve_node(search_tool, default_top_k=search_top_k),
@@ -495,7 +642,9 @@ def build_rag_graph(
         _make_answer_node(model, prompt_builder, generation_settings),
     )
 
-    builder.set_entry_point("retrieve")
+    # --- Entry point: always start with rewrite -------------------
+    builder.set_entry_point("rewrite_query")
+    builder.add_edge("rewrite_query", "retrieve")
 
     if web_search_tool is not None:
         # --- With web search fallback ---
@@ -519,7 +668,7 @@ def build_rag_graph(
         )
         builder.add_edge("web_search", "open")
     else:
-        # --- Without web search (original Day 3 topology) ---
+        # --- Without web search ---
         builder.add_edge("retrieve", "open")
 
     builder.add_edge("open", "answer")
@@ -540,6 +689,8 @@ def run_rag_graph(
     *,
     search_top_k: int | None = None,
     open_top_n: int | None = None,
+    chat_history: list[dict[str, str]] | None = None,
+    conversation_summary: str | None = None,
     run_type: str = "rag_graph",
     service_name: str = "agentic-workbench-rag-graph",
 ) -> RAGState:
@@ -556,6 +707,8 @@ def run_rag_graph(
                           Pass ``{}`` if you don't need config tracking.
         search_top_k:  Override the default search_top_k.
         open_top_n:  Override the default open_top_n.
+        chat_history:  Recent conversation turns for multi-turn chat.
+        conversation_summary:  Rolling summary of older conversation.
         run_type:  Run type label for the context.
         service_name:  Service name for tracing.
 
@@ -589,6 +742,10 @@ def run_rag_graph(
                 initial_state["search_top_k"] = search_top_k
             if open_top_n is not None:
                 initial_state["open_top_n"] = open_top_n
+            if chat_history is not None:
+                initial_state["chat_history"] = chat_history
+            if conversation_summary is not None:
+                initial_state["conversation_summary"] = conversation_summary
 
             # --- Invoke -------------------------------------------
             result: RAGState = graph.invoke(initial_state)
@@ -600,6 +757,7 @@ def run_rag_graph(
             "rag_graph_completed",
             {
                 "question": question[:200],
+                "rewritten_query": result.get("rewritten_query", "")[:200],
                 "answer_length": len(result.get("answer_text", "")),
                 "citation_count": len(result.get("citations", [])),
                 "web_citation_count": len(result.get("web_citations", [])),
@@ -607,6 +765,7 @@ def run_rag_graph(
                 "opened_count": len(result.get("opened", [])),
                 "web_search_used": result.get("web_search_used", False),
                 "web_results_count": len(result.get("web_results", [])),
+                "chat_turns": len(chat_history) if chat_history else 0,
                 "tokens_in": result.get("tokens_in", 0),
                 "tokens_out": result.get("tokens_out", 0),
                 "error": result.get("error"),
@@ -616,7 +775,7 @@ def run_rag_graph(
 
         if result.get("retrieved"):
             logger.log_retrieval(
-                query=question,
+                query=result.get("rewritten_query", question),
                 num_results=len(result["retrieved"]),
                 retrieval_method="hybrid",
                 duration_ms=total_ms,
@@ -648,7 +807,7 @@ def run_rag_graph(
 
         metrics.record_retrieval(
             final_count=len(result.get("opened", [])),
-            query=question,
+            query=result.get("rewritten_query", question),
             keyword_candidates=len(result.get("retrieved", [])),
             vector_candidates=len(result.get("retrieved", [])),
             reranked=len(result.get("retrieved", [])),
