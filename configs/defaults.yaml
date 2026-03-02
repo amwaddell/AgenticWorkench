@@ -9,10 +9,16 @@ model:
   max_tokens: 2048
   timeout_seconds: 60
 
-# Embedding settings 
+# Embedding settings
+#   provider: "http"  → use remote Infinity server (fast startup, recommended)
+#   provider: "local" → load sentence-transformers in-process (slow startup)
 embeddings:
-  provider: "sentence_transformers"
+  provider: "http"
   model_name: "intfloat/multilingual-e5-base"
+  # HTTP provider settings
+  base_url: "http://127.0.0.1:8081"
+  timeout_seconds: 120
+  # Local provider settings (only used when provider: local)
   batch_size: 32
   device: "mps"
 
@@ -26,10 +32,15 @@ retrieval:
   final_top_k: 5
 
 # Reranking settings
+#   provider: "http"           → use remote Infinity server (fast startup, recommended)
+#   provider: "cross_encoder"  → load cross-encoder in-process (slow startup)
 reranking:
   enabled: true
-  provider: "cross_encoder"
+  provider: "http"
   model_name: "BAAI/bge-reranker-v2-m3"
+  # HTTP provider settings
+  base_url: "http://127.0.0.1:8082"
+  timeout_seconds: 60
   top_n: 5
 
 # Context builder settings

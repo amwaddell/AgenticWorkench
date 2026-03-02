@@ -39,7 +39,6 @@ from workbench.core.config import (
     load_config,
 )
 from workbench.core.run_context import run_context
-from workbench.data_build.embeddings import SentenceTransformerEmbedder
 from workbench.graphs.rag_graph import build_rag_graph
 from workbench.graphs.researcher_graph import build_researcher_graph
 from workbench.graphs.supervisor_graph import build_supervisor_graph
@@ -50,7 +49,6 @@ from workbench.observability.tracing import setup_tracing, start_span
 from workbench.prompting.prompt_builder import PromptBuilder
 from workbench.retrieval.hybrid import HybridRetriever
 from workbench.retrieval.keyword_search import LanceDBKeywordSearcher
-from workbench.retrieval.rerankers import CrossEncoderReranker
 from workbench.retrieval.vector_search import LanceDBVectorSearcher
 from workbench.stores.chunk_store import ChunkStore
 from workbench.tools.open_chunk import OpenChunkTool
@@ -65,6 +63,84 @@ _TIMELINE_GRAPHS = {"researcher_graph"}
 _FULL_GRAPHS = {"supervisor_graph"}
 
 SUPPORTED_GRAPHS = _BASIC_GRAPHS | _TIMELINE_GRAPHS | _FULL_GRAPHS
+
+
+# ------------------------------------------------------------------ #
+#  Factory functions: build embedder / reranker from config            #
+# ------------------------------------------------------------------ #
+
+
+def build_embedder(cfg: WorkbenchConfig) -> Any:
+    """
+    Build an embedder based on config ``embeddings.provider``.
+
+    - ``"http"``  → lightweight :class:`HTTPEmbedder` (calls remote server)
+    - ``"local"`` or ``"sentence_transformers"`` → heavyweight
+      :class:`SentenceTransformerEmbedder` (loads model in-process)
+
+    Args:
+        cfg: Validated workbench config.
+
+    Returns:
+        Object satisfying the ``Embedder`` protocol.
+    """
+    emb_cfg = cfg.embeddings
+    provider = emb_cfg.get("provider", "http")
+
+    if provider == "http":
+        from workbench.data_build.http_embedder import HTTPEmbedder
+
+        return HTTPEmbedder(
+            base_url=emb_cfg.get("base_url", "http://127.0.0.1:8081"),
+            model_name=emb_cfg["model_name"],
+            timeout_seconds=emb_cfg.get("timeout_seconds", 120),
+        )
+
+    # Local fallback
+    from workbench.data_build.embeddings import SentenceTransformerEmbedder
+
+    return SentenceTransformerEmbedder(
+        model_name=emb_cfg["model_name"],
+        device=emb_cfg.get("device", "mps"),
+        batch_size=emb_cfg.get("batch_size", 32),
+    )
+
+
+def build_reranker(cfg: WorkbenchConfig) -> Any | None:
+    """
+    Build a reranker based on config ``reranking.provider``.
+
+    - ``"http"``           → lightweight :class:`HTTPReranker`
+    - ``"cross_encoder"``  → heavyweight :class:`CrossEncoderReranker`
+    - disabled             → ``None``
+
+    Args:
+        cfg: Validated workbench config.
+
+    Returns:
+        Object satisfying the ``Reranker`` protocol, or None.
+    """
+    rr_cfg = cfg.reranking
+    if not rr_cfg.get("enabled", True):
+        return None
+
+    provider = rr_cfg.get("provider", "http")
+
+    if provider == "http":
+        from workbench.retrieval.http_reranker import HTTPReranker
+
+        return HTTPReranker(
+            base_url=rr_cfg.get("base_url", "http://127.0.0.1:8082"),
+            model_name=rr_cfg["model_name"],
+            timeout_seconds=rr_cfg.get("timeout_seconds", 60),
+        )
+
+    # Local fallback
+    from workbench.retrieval.rerankers import CrossEncoderReranker
+
+    return CrossEncoderReranker(
+        model_name=rr_cfg["model_name"],
+    )
 
 
 class GraphRunner:
@@ -109,23 +185,15 @@ class GraphRunner:
             default_max_tokens=cfg.model.get("max_tokens", 2048),
         )
 
-        embedder = SentenceTransformerEmbedder(
-            model_name=cfg.embeddings["model_name"],
-            device=cfg.embeddings.get("device", "mps"),
-            batch_size=cfg.embeddings.get("batch_size", 32),
-        )
+        # --- Embedder and reranker via factory functions ---------------
+        embedder = build_embedder(cfg)
+        reranker = build_reranker(cfg)
 
         keyword_searcher = LanceDBKeywordSearcher(db_path=db_path)
         vector_searcher = LanceDBVectorSearcher(
             db_path=db_path,
             embedder=embedder,
         )
-
-        reranker = None
-        if cfg.reranking.get("enabled", True):
-            reranker = CrossEncoderReranker(
-                model_name=cfg.reranking["model_name"],
-            )
 
         chunk_store = ChunkStore(db_path=db_path)
 

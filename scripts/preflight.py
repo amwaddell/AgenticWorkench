@@ -5,18 +5,16 @@ Unified preflight check for the Agentic Workbench.
 Verifies that all components are ready to run:
     1. LLM server is reachable
     2. Vector database exists and has data
-    3. Embedding model loads successfully
-    4. Reranker model loads successfully
+    3. Embedding service is reachable (http) or model loads (local)
+    4. Reranker service is reachable (http) or model loads (local)
     5. LangGraph graphs compile (with fakes)
     6. Streamlit is installed
     7. Phoenix trace viewer is launched (optional)
 
-Replaces the per-day ``verify_day*.py`` scripts with a single command.
-
 Usage:
     python scripts/preflight.py                # check all + start Phoenix
     python scripts/preflight.py --no-phoenix   # check only
-    python scripts/preflight.py --quick        # skip model downloads
+    python scripts/preflight.py --quick        # skip model/service checks
 """
 
 from __future__ import annotations
@@ -93,46 +91,105 @@ def check_vector_db(cfg) -> bool:
 
 
 def check_embedder(cfg) -> bool:
-    """Load embedding model (ensures weights are cached)."""
-    print("[3/6] Embedding model...", end=" ", flush=True)
-    t0 = time.time()
+    """Check embedding service (http) or load model (local)."""
+    emb_cfg = cfg.embeddings
+    provider = emb_cfg.get("provider", "http")
 
-    from workbench.data_build.embeddings import SentenceTransformerEmbedder
+    if provider == "http":
+        print("[3/6] Embedding service...", end=" ", flush=True)
+        t0 = time.time()
 
-    try:
-        embedder = SentenceTransformerEmbedder(
-            model_name=cfg.embeddings["model_name"],
-            device=cfg.embeddings.get("device", "mps"),
-            batch_size=cfg.embeddings.get("batch_size", 32),
+        from workbench.data_build.http_embedder import HTTPEmbedder
+
+        base_url = emb_cfg.get("base_url", "http://127.0.0.1:8081")
+        embedder = HTTPEmbedder(
+            base_url=base_url,
+            model_name=emb_cfg["model_name"],
         )
-        embedder.embed_texts(["preflight check"])
-        print(f"OK ({time.time() - t0:.1f}s) — {cfg.embeddings['model_name']}")
-        return True
-    except Exception as e:
-        print(f"FAILED ({time.time() - t0:.1f}s)")
-        print(f"       {e}")
-        return False
+
+        if not embedder.health_check():
+            print(f"UNREACHABLE ({time.time() - t0:.1f}s)")
+            print(f"       Server not responding at {base_url}")
+            print("       → Start with: bash scripts/start_embedding_server.sh")
+            return False
+
+        # Warm-up: send a small embedding request
+        try:
+            embedder.embed_texts(["preflight check"])
+            print(
+                f"OK ({time.time() - t0:.1f}s) — {emb_cfg['model_name']} @ {base_url}"
+            )
+            return True
+        except Exception as e:
+            print(f"FAILED ({time.time() - t0:.1f}s)")
+            print(f"       Health OK but embedding failed: {e}")
+            return False
+
+    else:
+        print("[3/6] Embedding model (local)...", end=" ", flush=True)
+        t0 = time.time()
+
+        from workbench.data_build.embeddings import SentenceTransformerEmbedder
+
+        try:
+            embedder = SentenceTransformerEmbedder(
+                model_name=emb_cfg["model_name"],
+                device=emb_cfg.get("device", "mps"),
+                batch_size=emb_cfg.get("batch_size", 32),
+            )
+            embedder.embed_texts(["preflight check"])
+            print(f"OK ({time.time() - t0:.1f}s) — {emb_cfg['model_name']}")
+            return True
+        except Exception as e:
+            print(f"FAILED ({time.time() - t0:.1f}s)")
+            print(f"       {e}")
+            return False
 
 
 def check_reranker(cfg) -> bool:
-    """Load reranker model (ensures weights are cached)."""
-    if not cfg.reranking.get("enabled", True):
+    """Check reranker service (http) or load model (local)."""
+    rr_cfg = cfg.reranking
+    if not rr_cfg.get("enabled", True):
         print("[4/6] Reranker... DISABLED in config, skipping")
         return True
 
-    print("[4/6] Reranker model...", end=" ", flush=True)
-    t0 = time.time()
+    provider = rr_cfg.get("provider", "http")
 
-    from workbench.retrieval.rerankers import CrossEncoderReranker
+    if provider == "http":
+        print("[4/6] Reranker service...", end=" ", flush=True)
+        t0 = time.time()
 
-    try:
-        CrossEncoderReranker(model_name=cfg.reranking["model_name"])
-        print(f"OK ({time.time() - t0:.1f}s) — {cfg.reranking['model_name']}")
+        from workbench.retrieval.http_reranker import HTTPReranker
+
+        base_url = rr_cfg.get("base_url", "http://127.0.0.1:8082")
+        reranker = HTTPReranker(
+            base_url=base_url,
+            model_name=rr_cfg["model_name"],
+        )
+
+        if not reranker.health_check():
+            print(f"UNREACHABLE ({time.time() - t0:.1f}s)")
+            print(f"       Server not responding at {base_url}")
+            print("       → Start with: bash scripts/start_reranker_server.sh")
+            return False
+
+        print(f"OK ({time.time() - t0:.1f}s) — {rr_cfg['model_name']} @ {base_url}")
         return True
-    except Exception as e:
-        print(f"FAILED ({time.time() - t0:.1f}s)")
-        print(f"       {e}")
-        return False
+
+    else:
+        print("[4/6] Reranker model (local)...", end=" ", flush=True)
+        t0 = time.time()
+
+        from workbench.retrieval.rerankers import CrossEncoderReranker
+
+        try:
+            CrossEncoderReranker(model_name=rr_cfg["model_name"])
+            print(f"OK ({time.time() - t0:.1f}s) — {rr_cfg['model_name']}")
+            return True
+        except Exception as e:
+            print(f"FAILED ({time.time() - t0:.1f}s)")
+            print(f"       {e}")
+            return False
 
 
 def check_graphs_compile() -> bool:
@@ -266,7 +323,7 @@ def main():
     parser.add_argument(
         "--quick",
         action="store_true",
-        help="Skip model-download checks (embedder, reranker)",
+        help="Skip model/service checks (embedder, reranker)",
     )
     args = parser.parse_args()
 
@@ -283,7 +340,7 @@ def main():
     results = [check_llm_server(cfg), check_vector_db(cfg)]
 
     if args.quick:
-        print("[3/6] Embedding model... SKIPPED (--quick)")
+        print("[3/6] Embedding... SKIPPED (--quick)")
         results.append(True)
         print("[4/6] Reranker... SKIPPED (--quick)")
         results.append(True)

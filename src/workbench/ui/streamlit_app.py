@@ -65,28 +65,30 @@ def _build_model(_cfg):
     )
 
 
-@st.cache_resource(
-    show_spinner="Loading embedding model… (first time may download weights)"
-)
+@st.cache_resource(show_spinner="Connecting to embedding service…")
 def _build_embedder(_cfg):
-    """Load the sentence-transformer embedding model."""
-    from workbench.data_build.embeddings import SentenceTransformerEmbedder
+    """
+    Build embedder from config.
 
-    return SentenceTransformerEmbedder(
-        model_name=_cfg.embeddings["model_name"],
-        device=_cfg.embeddings.get("device", "mps"),
-        batch_size=_cfg.embeddings.get("batch_size", 32),
-    )
+    With ``provider: http`` this is instant (just creates an HTTP client).
+    With ``provider: local`` this loads weights in-process (slow).
+    """
+    from workbench.systems.runner import build_embedder
+
+    return build_embedder(_cfg)
 
 
-@st.cache_resource(show_spinner="Loading reranker model…")
+@st.cache_resource(show_spinner="Connecting to reranker service…")
 def _build_reranker(_cfg):
-    """Load the cross-encoder reranker (or None if disabled)."""
-    if not _cfg.reranking.get("enabled", True):
-        return None
-    from workbench.retrieval.rerankers import CrossEncoderReranker
+    """
+    Build reranker from config (or None if disabled).
 
-    return CrossEncoderReranker(model_name=_cfg.reranking["model_name"])
+    With ``provider: http`` this is instant (just creates an HTTP client).
+    With ``provider: cross_encoder`` this loads weights in-process (slow).
+    """
+    from workbench.systems.runner import build_reranker
+
+    return build_reranker(_cfg)
 
 
 @st.cache_resource(show_spinner="Opening chunk store…")
@@ -637,6 +639,19 @@ def _render_sidebar(cfg) -> str:
             f"{cfg.model.get('model_name', 'unknown')} @ {cfg.model['base_url']}"
         )
 
+        # --- Service info ---------------------------------------------
+        emb_provider = cfg.embeddings.get("provider", "http")
+        rr_provider = cfg.reranking.get("provider", "http")
+        st.markdown("**Services**")
+        if emb_provider == "http":
+            st.caption(f"Embedder: {cfg.embeddings.get('base_url', '?')}")
+        else:
+            st.caption(f"Embedder: local ({cfg.embeddings['model_name']})")
+        if rr_provider == "http":
+            st.caption(f"Reranker: {cfg.reranking.get('base_url', '?')}")
+        else:
+            st.caption(f"Reranker: local ({cfg.reranking['model_name']})")
+
         # --- Phoenix link ---------------------------------------------
         phoenix_url = cfg.observability.get("phoenix_endpoint", "http://localhost:6006")
         st.markdown(f"**Traces**: [Phoenix UI]({phoenix_url})")
@@ -656,7 +671,10 @@ def _render_sidebar(cfg) -> str:
                     "reranking": cfg.reranking,
                     "web_search": cfg.web_search,
                     "supervisor": getattr(cfg, "supervisor", {}),
-                    "embeddings": {"model_name": cfg.embeddings["model_name"]},
+                    "embeddings": {
+                        "provider": cfg.embeddings.get("provider", "http"),
+                        "model_name": cfg.embeddings["model_name"],
+                    },
                 },
                 expanded=False,
             )
@@ -702,7 +720,9 @@ def main() -> None:
             "Make sure:\n"
             "1. LanceDB indexes are built (`python scripts/build_vector_index.py`)\n"
             "2. Model server is running (`bash scripts/start_model_server.sh`)\n"
-            "3. All dependencies are installed (`pip install -r requirements.txt`)"
+            "3. Embedding + reranker servers are running "
+            "(`bash scripts/start_model_stack.sh`)\n"
+            "4. All dependencies are installed (`pip install -r requirements.txt`)"
         )
         st.stop()
 

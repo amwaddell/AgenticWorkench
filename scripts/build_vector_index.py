@@ -11,6 +11,9 @@ Usage:
         --db-path data/indexes/active/lancedb \
         --batch-size 64
 
+    # Force local embedder (even if config says http):
+    python scripts/build_vector_index.py --provider local
+
 This will:
     1. Load chunks from chunks.parquet
     2. Embed all chunk texts using the configured model
@@ -34,7 +37,6 @@ project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
 from workbench.core.config import load_config
-from workbench.data_build.embeddings import SentenceTransformerEmbedder
 from workbench.data_build.index_vector import build_vector_index
 from workbench.observability.tracing import setup_tracing
 
@@ -69,7 +71,14 @@ def main() -> None:
         "--device",
         type=str,
         default=None,
-        help="Device for embedding model: cpu or mps (default: from config)",
+        help="Device for local embedding model: cpu or mps (default: from config)",
+    )
+    parser.add_argument(
+        "--provider",
+        type=str,
+        default=None,
+        choices=["http", "local"],
+        help="Override embedding provider (default: from config)",
     )
     args = parser.parse_args()
 
@@ -87,6 +96,9 @@ def main() -> None:
         or Path(config.paths.get("active_index", "data/indexes/active")) / "lancedb"
     )
 
+    # Determine provider: CLI override > config
+    provider = args.provider or emb_cfg.get("provider", "http")
+
     # --- Setup tracing (sends to Phoenix if running) ---
     setup_tracing(service_name="build-vector-index")
 
@@ -96,20 +108,41 @@ def main() -> None:
         print("Run the chunking step first (scripts/build_chunks.py)")
         sys.exit(1)
 
-    # --- Load embedding model ---
-    print(f"Loading embedding model: {model_name} (device={device})")
-    t0 = time.time()
-    embedder = SentenceTransformerEmbedder(
-        model_name=model_name,
-        device=device,
-        batch_size=batch_size,
-    )
-    print(f"Model loaded in {time.time() - t0:.1f}s  (dim={embedder.dimension})")
+    # --- Load embedding client/model ---
+    if provider == "http":
+        from workbench.data_build.http_embedder import HTTPEmbedder
+
+        base_url = emb_cfg.get("base_url", "http://127.0.0.1:8081")
+        print(f"Connecting to embedding server: {base_url} ({model_name})")
+        t0 = time.time()
+        embedder = HTTPEmbedder(
+            base_url=base_url,
+            model_name=model_name,
+            timeout_seconds=emb_cfg.get("timeout_seconds", 120),
+        )
+        if not embedder.health_check():
+            print(f"ERROR: Embedding server not reachable at {base_url}")
+            print("Start it with: bash scripts/start_embedding_server.sh")
+            print("Or use --provider local to embed in-process.")
+            sys.exit(1)
+        print(f"Connected in {time.time() - t0:.1f}s")
+    else:
+        from workbench.data_build.embeddings import SentenceTransformerEmbedder
+
+        print(f"Loading embedding model locally: {model_name} (device={device})")
+        t0 = time.time()
+        embedder = SentenceTransformerEmbedder(
+            model_name=model_name,
+            device=device,
+            batch_size=batch_size,
+        )
+        print(f"Model loaded in {time.time() - t0:.1f}s  (dim={embedder.dimension})")
 
     # --- Build index ---
     print("\nBuilding vector index...")
     print(f"  chunks:     {args.chunks}")
     print(f"  db_path:    {db_path}")
+    print(f"  provider:   {provider}")
     print(f"  batch_size: {batch_size}")
     print()
 
