@@ -1,5 +1,5 @@
 """
-Citation extraction and validation.
+Citation extraction, validation, and numberization.
 
 This is the single source of truth for citation parsing and policy
 enforcement.  Both ``rag_graph`` and ``researcher_graph`` import
@@ -16,11 +16,26 @@ Two policy presets are provided:
     timeline item has supporting chunk IDs.  Triggers a single
     repair attempt on failure.
 
+Numberization (post-processing):
+
+``numberize_citations``
+    Replaces raw ``[chunk_id_hash]`` references in an answer with
+    sequential ``[1]``, ``[2]``, etc., ordered by first appearance.
+    Returns the cleaned text plus a structured citation map for
+    display in the UI.
+
+``numberize_result``
+    Convenience wrapper that applies ``numberize_citations`` to a
+    graph result dict in-place.
+
 Usage::
 
     from workbench.prompting.citations import (
         extract_citations,
+        extract_web_citations,
         validate_citations,
+        numberize_citations,
+        numberize_result,
         RESEARCHER_STRICT,
     )
 
@@ -34,6 +49,12 @@ Usage::
     if not result.valid:
         # re-prompt / repair
         ...
+
+    # Post-process: replace hashes with [1], [2], etc.
+    clean_text, citation_map = numberize_citations(answer_text, opened_chunks)
+
+    # Or, on a full graph result dict:
+    numberize_result(graph_result)
 """
 
 from __future__ import annotations
@@ -168,6 +189,24 @@ def extract_citations(answer_text: str, known_ids: list[str]) -> list[str]:
     return cited
 
 
+def extract_web_citations(answer_text: str, urls: list[str]) -> list[str]:
+    """
+    Find URLs mentioned in the answer text.
+
+    Args:
+        answer_text: The generated answer string.
+        urls: List of URLs from web search results.
+
+    Returns:
+        List of cited URLs found in the text.
+    """
+    cited: list[str] = []
+    for url in urls:
+        if url and url in answer_text:
+            cited.append(url)
+    return cited
+
+
 def find_all_bracket_ids(text: str) -> list[str]:
     """
     Extract every ``[some_id]`` token from *text*.
@@ -185,6 +224,172 @@ def find_all_bracket_ids(text: str) -> list[str]:
         if cid not in seen:
             seen.add(cid)
             result.append(cid)
+    return result
+
+
+# ------------------------------------------------------------------ #
+#  Numberization — post-process [chunk_id] → [1], [2], etc.           #
+# ------------------------------------------------------------------ #
+
+# Matches tokens like [abc123def456] — anything in brackets that
+# looks like a chunk ID (hex hash or alphanumeric with underscores).
+_BRACKET_TOKEN_RE = re.compile(r"\[([A-Za-z0-9_]+)\]")
+
+
+def numberize_citations(
+    answer_text: str,
+    opened_chunks: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    """
+    Replace ``[chunk_id]`` references with sequential ``[1]``, ``[2]``, etc.
+
+    The first chunk_id to appear in the text gets ``[1]``, the second
+    unique chunk_id gets ``[2]``, and so on.  Subsequent occurrences of
+    the same chunk_id reuse the same number.
+
+    Only chunk_ids that match an entry in *opened_chunks* are
+    numberized.  Unknown IDs (hallucinated or web-style) are left
+    untouched.
+
+    Example::
+
+        # Raw LLM output:
+        "Rome fell in 476 AD [b165567c4c9e5be6]. The last emperor
+         was Romulus [b165567c4c9e5be6][a3f29bc1de840712]."
+
+        # After numberize_citations():
+        "Rome fell in 476 AD [1]. The last emperor
+         was Romulus [1][2]."
+
+        # citation_map:
+        [
+            {"number": 1, "chunk_id": "b165567c4c9e5be6",
+             "title": "Fall of the Western Roman Empire", ...},
+            {"number": 2, "chunk_id": "a3f29bc1de840712",
+             "title": "Romulus Augustulus", ...},
+        ]
+
+    Args:
+        answer_text:    The raw answer text containing ``[chunk_id]``
+                        references.
+        opened_chunks:  List of opened chunk dicts, each with at least
+                        ``chunk_id``, ``title``, and ``text`` keys.
+
+    Returns:
+        A tuple of:
+        - **numbered_text**: The answer with ``[1]``, ``[2]``, etc.
+        - **citation_map**: Ordered list of dicts, one per unique cited
+          chunk, with keys:
+
+          - ``number`` (int): The citation number (1-based).
+          - ``chunk_id`` (str): Original chunk ID hash.
+          - ``title`` (str): Wikipedia article title.
+          - ``section`` (str | None): Section heading within the article.
+          - ``snippet`` (str): First ~150 chars of the chunk text.
+    """
+    if not answer_text or not opened_chunks:
+        return answer_text, []
+
+    # Build a lookup: chunk_id → chunk dict
+    chunk_lookup: dict[str, dict[str, Any]] = {}
+    for chunk in opened_chunks:
+        cid = chunk.get("chunk_id", "")
+        if cid:
+            chunk_lookup[cid] = chunk
+
+    # Pass 1: scan for all [token] matches in order of appearance,
+    # assign numbers to known chunk_ids.  First appearance = lowest number.
+    id_to_number: dict[str, int] = {}
+    next_number = 1
+
+    for match in _BRACKET_TOKEN_RE.finditer(answer_text):
+        token = match.group(1)
+        if token in chunk_lookup and token not in id_to_number:
+            id_to_number[token] = next_number
+            next_number += 1
+
+    # Nothing to numberize
+    if not id_to_number:
+        return answer_text, []
+
+    # Pass 2: replace all [chunk_id] with [N] for known IDs.
+    # Process from right to left so character offsets stay valid.
+    matches = list(_BRACKET_TOKEN_RE.finditer(answer_text))
+    result_chars = list(answer_text)
+
+    for match in reversed(matches):
+        token = match.group(1)
+        if token in id_to_number:
+            num = id_to_number[token]
+            replacement = f"[{num}]"
+            result_chars[match.start() : match.end()] = list(replacement)
+
+    numbered_text = "".join(result_chars)
+
+    # Pass 3: build the citation map in number order.
+    citation_map: list[dict[str, Any]] = []
+    for cid, num in sorted(id_to_number.items(), key=lambda x: x[1]):
+        chunk = chunk_lookup[cid]
+        text = chunk.get("text", "")
+        snippet = _make_snippet(text, max_len=150)
+
+        citation_map.append(
+            {
+                "number": num,
+                "chunk_id": cid,
+                "title": chunk.get("title", "Untitled"),
+                "section": chunk.get("section"),
+                "snippet": snippet,
+            }
+        )
+
+    return numbered_text, citation_map
+
+
+def _make_snippet(text: str, max_len: int = 150) -> str:
+    """Truncate text to a readable snippet, breaking at word boundaries."""
+    if not text:
+        return ""
+    snippet = text[:max_len].strip()
+    if len(text) > max_len:
+        last_space = snippet.rfind(" ")
+        if last_space > max_len // 2:
+            snippet = snippet[:last_space]
+        snippet += "…"
+    return snippet
+
+
+def numberize_result(result: dict[str, Any]) -> dict[str, Any]:
+    """
+    Post-process a graph result dict: numberize citations in-place.
+
+    This is the convenience wrapper meant to be called after any
+    graph returns.  It reads ``answer_text`` and ``opened`` from the
+    result, applies :func:`numberize_citations`, and writes back:
+
+    - ``answer_text`` — rewritten with ``[1]``, ``[2]``, etc.
+    - ``citation_map`` — ordered list of citation metadata dicts.
+
+    The original ``citations`` list (raw chunk IDs) is preserved
+    untouched for backward compatibility and logging.
+
+    Args:
+        result: The graph result dict (mutated in-place and returned).
+
+    Returns:
+        The same dict with ``answer_text`` rewritten and
+        ``citation_map`` added.
+    """
+    answer_text = result.get("answer_text", "")
+    opened = result.get("opened", [])
+
+    if answer_text and opened:
+        numbered_text, citation_map = numberize_citations(answer_text, opened)
+        result["answer_text"] = numbered_text
+        result["citation_map"] = citation_map
+    else:
+        result["citation_map"] = []
+
     return result
 
 

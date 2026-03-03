@@ -1,11 +1,16 @@
 """
-Streamlit-based local chat UI for the agentic workbench.
+Streamlit chat UI package.
 
-Launch with::
-
-    streamlit run src/workbench/ui/streamlit_app.py
-
-Or use the convenience script::
-
-    bash scripts/run_ui.sh
+Modules
+-------
+components
+    Cached builders for model, embedder, retriever, tools, graph.
+chat_state
+    Chat history window and conversation summary management.
+graph_runner
+    Streaming graph execution with citation post-processing.
+renderers
+    Expandable panels: citations, evidence, timeline, routing, etc.
+streamlit_app
+    Main entry point (``streamlit run``).
 """
