@@ -12,6 +12,7 @@ Supported systems:
     ``rag_graph``          — search → open → answer
     ``researcher_graph``   — search → open → timeline → answer → validate
     ``supervisor_graph``   — routes to specialist subgraphs
+                             (with optional task decomposition, Day 11)
 
 Usage::
 
@@ -25,7 +26,7 @@ Usage (multi-turn chat)::
 
     runner = GraphRunner()
     result = runner.run(
-        "rag_graph",
+        "supervisor_graph",
         "What was that battle about?",
         chat_history=[
             {"role": "user", "content": "Tell me about WW2"},
@@ -37,7 +38,7 @@ Usage (multi-turn chat)::
 Or as a one-liner::
 
     from workbench.systems.runner import run_graph
-    result = run_graph("rag_graph", "What is photosynthesis?")
+    result = run_graph("supervisor_graph", "What is photosynthesis?")
 """
 
 from __future__ import annotations
@@ -325,6 +326,7 @@ class GraphRunner:
 
         if graph_name == "supervisor_graph":
             sup_cfg = getattr(cfg, "supervisor", {}) or {}
+            decomposer_cfg = getattr(cfg, "decomposer", {}) or {}  # ← NEW (Day 11)
             return build_supervisor_graph(
                 **common,
                 timeline_tool=c["timeline_tool"],
@@ -333,6 +335,15 @@ class GraphRunner:
                 routing_mode=overrides.get(
                     "routing_mode",
                     sup_cfg.get("routing_mode", "hybrid"),
+                ),
+                # ← NEW (Day 11): decomposer settings from config
+                decomposer_enabled=overrides.get(
+                    "decomposer_enabled",
+                    decomposer_cfg.get("enabled", True),
+                ),
+                decomposer_max_workers=overrides.get(
+                    "decomposer_max_workers",
+                    decomposer_cfg.get("max_workers", 4),
                 ),
             )
 
@@ -411,15 +422,19 @@ class GraphRunner:
                 f"{graph_name}_completed",
                 {
                     "question": question[:200],
-                    "rewritten_query": result.get("rewritten_query", "")[:200],
-                    "answer_length": len(result.get("answer_text", "")),
-                    "citation_count": len(result.get("citations", [])),
-                    "retrieved_count": len(result.get("retrieved", [])),
-                    "opened_count": len(result.get("opened", [])),
-                    "timeline_count": len(result.get("timeline", [])),
+                    "rewritten_query": (result.get("rewritten_query") or "")[:200],
+                    "answer_length": len(result.get("answer_text") or ""),
+                    "citation_count": len(result.get("citations") or []),
+                    "retrieved_count": len(result.get("retrieved") or []),
+                    "opened_count": len(result.get("opened") or []),
+                    "timeline_count": len(result.get("timeline") or []),
                     "chat_turns": len(chat_history) if chat_history else 0,
-                    "tokens_in": result.get("tokens_in", 0),
-                    "tokens_out": result.get("tokens_out", 0),
+                    "tokens_in": result.get("tokens_in") or 0,
+                    "tokens_out": result.get("tokens_out") or 0,
+                    # ← NEW (Day 11): decomposition metadata in logs
+                    "is_decomposed": result.get("is_decomposed", False),
+                    "sub_question_count": len(result.get("sub_questions") or []),
+                    "decompose_latency_ms": result.get("decompose_latency_ms") or 0.0,
                     "error": result.get("error"),
                     "total_ms": round(total_ms, 1),
                 },
@@ -427,20 +442,20 @@ class GraphRunner:
 
             if result.get("retrieved"):
                 logger.log_retrieval(
-                    query=result.get("rewritten_query", question),
+                    query=result.get("rewritten_query") or question,
                     num_results=len(result["retrieved"]),
                     retrieval_method="hybrid",
                     duration_ms=total_ms,
                 )
 
-            tokens_out = result.get("tokens_out", 0)
+            tokens_out = result.get("tokens_out") or 0
             model_name = self.config.model.get("model_name", "local-model")
             if tokens_out > 0:
                 logger.log_model_call(
                     model_name=model_name,
-                    tokens_in=result.get("tokens_in", 0),
+                    tokens_in=result.get("tokens_in") or 0,
                     tokens_out=tokens_out,
-                    duration_ms=result.get("model_latency_ms", 0.0),
+                    duration_ms=result.get("model_latency_ms") or 0.0,
                 )
 
             # --- Metrics ---
@@ -453,19 +468,28 @@ class GraphRunner:
             if tokens_out > 0:
                 metrics.record_model_tokens(
                     model_name=model_name,
-                    tokens_in=result.get("tokens_in", 0),
+                    tokens_in=result.get("tokens_in") or 0,
                     tokens_out=tokens_out,
-                    duration_ms=result.get("model_latency_ms", 0.0),
+                    duration_ms=result.get("model_latency_ms") or 0.0,
                 )
 
             metrics.record_retrieval(
-                final_count=len(result.get("opened", [])),
-                query=result.get("rewritten_query", question),
-                keyword_candidates=len(result.get("retrieved", [])),
-                vector_candidates=len(result.get("retrieved", [])),
-                reranked=len(result.get("retrieved", [])),
+                final_count=len(result.get("opened") or []),
+                query=result.get("rewritten_query") or question,
+                keyword_candidates=len(result.get("retrieved") or []),
+                vector_candidates=len(result.get("retrieved") or []),
+                reranked=len(result.get("retrieved") or []),
                 duration_ms=total_ms,
             )
+
+            # ← NEW (Day 11): decomposer latency metric
+            decompose_ms = result.get("decompose_latency_ms") or 0.0
+            if decompose_ms > 0:
+                metrics.record_component_latency(
+                    component_name=f"{graph_name}.decomposer",
+                    duration_ms=decompose_ms,
+                    component_type="decomposer",
+                )
 
             print(f"\nRun ID: {ctx.run_id}")
             return result

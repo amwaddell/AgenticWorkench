@@ -8,16 +8,23 @@ Routes incoming questions to the best specialist subgraph:
 - **timeline_research** — researcher graph with timeline + citation validation
 - **math** — calculator tool for arithmetic questions
 
+**Day 11 addition**: task decomposition.  When ``decomposer.enabled``
+is ``True`` in config, the graph inserts a decompose-check node
+before routing.  Multi-part questions are split into sub-questions
+that run through the RAG pipeline in parallel, then synthesised.
+
 Routing logic lives in ``workbench.graphs.routing`` (heuristic rules
-+ LLM fallback).  This module contains only the LangGraph node
-factories, the graph builder, and the observability runner.
++ LLM fallback).  Decomposition logic lives in
+``workbench.graphs.decomposer``.  This module contains only the
+LangGraph node factories, the graph builder, and the observability runner.
 
-Topology::
+Topology (simple question — unchanged)::
 
-    route_question ──[local_rag]──────→ run_local_rag ──→ merge → END
-                   ──[web_research]───→ run_web_research ─→ merge → END
-                   ──[timeline]───────→ run_timeline ────→ merge → END
-                   ──[math]───────────→ run_math ────────→ merge → END
+    rewrite_query → decompose_check ──[simple]──→ route_question ──→ [subgraph] → merge → END
+
+Topology (multi-part question)::
+
+    rewrite_query → decompose_check ──[decomposed]──→ parallel_retrieve → synthesise → merge → END
 
 Usage::
 
@@ -27,12 +34,20 @@ Usage::
         model=llm,
         web_search_tool=web_search_tool,
         calculator_tool=calculator_tool,
+        decomposer_enabled=True,
     )
-    result = graph.invoke({"question": "What is 17% of 340?"})
+    result = graph.invoke({"question": "When did WW1 start and end?"})
 
-Usage (with observability)::
+Usage (multi-turn chat)::
 
-    result = run_supervisor_graph(graph=graph, question="…", config_snapshot=snap)
+    result = graph.invoke({
+        "question": "What about that war — when did it start and end?",
+        "chat_history": [
+            {"role": "user", "content": "Tell me about WW1"},
+            {"role": "assistant", "content": "World War I was ..."},
+        ],
+        "conversation_summary": "Discussing World War I.",
+    })
 """
 
 from __future__ import annotations
@@ -43,6 +58,12 @@ from typing import Any
 from langgraph.graph import END, StateGraph
 
 from workbench.graphs.base_state import SupervisorState
+from workbench.graphs.decomposer import (  # ← NEW (Day 11)
+    decompose_dispatcher,
+    make_decompose_node,
+    make_parallel_retrieve_node,
+    make_synthesise_node,
+)
 from workbench.graphs.routing import (
     DEFAULT_ROUTE,
     ROUTE_AMBIGUOUS,
@@ -60,6 +81,98 @@ from workbench.observability.tracing import add_span_attributes, start_span
 # ------------------------------------------------------------------ #
 
 
+def _make_rewrite_query_node(
+    model: Any,
+    prompt_builder: Any | None,
+    generation_settings: dict[str, Any] | None,
+) -> Any:
+    """
+    Create the query rewrite node for multi-turn conversations.  ← NEW (Day 11)
+
+    Runs BEFORE decompose_check so the decomposer sees a resolved
+    standalone query (not a pronoun-heavy follow-up).
+
+    Re-uses the same logic as ``rag_graph._make_rewrite_query_node``
+    but placed at the supervisor level so it happens exactly once.
+    """
+    from workbench.prompting.prompt_builder import format_conversation_context
+
+    gen_settings = {
+        **(generation_settings or {}),
+        "temperature": 0.1,
+        "max_tokens": 100,
+    }
+
+    _FALLBACK_REWRITE = (
+        "Rewrite the following question as a standalone search query, "
+        "resolving any pronouns or references using the conversation context. "
+        "Output ONLY the rewritten query.\n\n"
+        "{conversation_context}\n"
+        "Latest question: {question}\n\n"
+        "Standalone query:"
+    )
+
+    def rewrite_query_node(state: SupervisorState) -> dict[str, Any]:
+        chat_history = state.get("chat_history", [])
+        conversation_summary = state.get("conversation_summary", "")
+        question = state["question"]
+
+        # No history → skip rewrite
+        if not chat_history:
+            return {"rewritten_query": question}
+
+        with start_span(
+            "graph.supervisor.rewrite_query",
+            attributes={
+                "question": question[:200],
+                "chat_turns": len(chat_history),
+            },
+        ):
+            try:
+                conversation_context = format_conversation_context(
+                    chat_history=chat_history,
+                    conversation_summary=conversation_summary,
+                )
+
+                if prompt_builder is not None:
+                    try:
+                        user_prompt = prompt_builder.render(
+                            "chat_query_rewrite",
+                            question=question,
+                            conversation_context=conversation_context,
+                        )
+                    except FileNotFoundError:
+                        user_prompt = _FALLBACK_REWRITE.format(
+                            question=question,
+                            conversation_context=conversation_context,
+                        )
+                else:
+                    user_prompt = _FALLBACK_REWRITE.format(
+                        question=question,
+                        conversation_context=conversation_context,
+                    )
+
+                messages = [{"role": "user", "content": user_prompt}]
+                response = model.generate(messages, **gen_settings)
+
+                rewritten = response.text.strip()
+                if not rewritten or len(rewritten) > 300:
+                    rewritten = question
+
+                add_span_attributes(
+                    {
+                        "rewritten_query": rewritten[:200],
+                        "original_question": question[:200],
+                    }
+                )
+                return {"rewritten_query": rewritten}
+
+            except Exception:
+                return {"rewritten_query": question}
+
+    return rewrite_query_node
+
+
 def _make_route_node(
     model: Any | None,
     routing_mode: str = "hybrid",
@@ -71,10 +184,14 @@ def _make_route_node(
     Classifies the question and writes the route + metadata into state.
     Delegates to ``heuristic_route`` and ``llm_route`` from the
     ``routing`` subpackage.
+
+    CHANGED (Day 11): Uses ``rewritten_query`` when available so routing
+    works correctly with chat context.
     """
 
     def route_node(state: SupervisorState) -> dict[str, Any]:
-        question = state["question"]
+        # ← CHANGED: prefer rewritten query for routing accuracy
+        question = state.get("rewritten_query") or state["question"]
 
         with start_span(
             "graph.supervisor.route",
@@ -159,11 +276,20 @@ def _make_local_rag_node(rag_subgraph: Any) -> Any:
             attributes={"question": question[:200]},
         ):
             try:
-                sub_input: dict[str, Any] = {"question": question}
+                # ← CHANGED (Day 11): pass rewritten_query so the
+                # rag_subgraph's rewrite_query node can skip redundant work
+                sub_input: dict[str, Any] = {
+                    "question": state.get("rewritten_query") or question,
+                }
                 if "search_top_k" in state:
                     sub_input["search_top_k"] = state["search_top_k"]
                 if "open_top_n" in state:
                     sub_input["open_top_n"] = state["open_top_n"]
+                # Pass chat context so rag_graph answer node can use it
+                if state.get("chat_history"):
+                    sub_input["chat_history"] = state["chat_history"]
+                if state.get("conversation_summary"):
+                    sub_input["conversation_summary"] = state["conversation_summary"]
 
                 result = rag_subgraph.invoke(sub_input)
 
@@ -212,7 +338,8 @@ def _make_web_research_node(
     )
 
     def run_web_research(state: SupervisorState) -> dict[str, Any]:
-        question = state["question"]
+        # ← CHANGED (Day 11): prefer rewritten query
+        question = state.get("rewritten_query") or state["question"]
 
         with start_span(
             "graph.supervisor.web_research",
@@ -472,6 +599,7 @@ def _make_merge_node() -> Any:
                 "route": state.get("route", "unknown"),
                 "subgraph_used": state.get("subgraph_used", "unknown"),
                 "has_answer": bool(state.get("answer_text")),
+                "is_decomposed": state.get("is_decomposed", False),  # ← NEW
             },
         ):
             return {}
@@ -497,11 +625,18 @@ def build_supervisor_graph(
     timeline_tool: Any | None = None,
     calculator_tool: Any | None = None,
     routing_mode: str = "hybrid",
+    decomposer_enabled: bool = True,  # ← NEW (Day 11)
+    decomposer_max_workers: int = 4,  # ← NEW (Day 11)
 ) -> Any:
     """
     Build and compile the supervisor (hierarchical) graph.
 
     Routes that lack required tools gracefully fall back to ``local_rag``.
+
+    Day 11 additions:
+        When ``decomposer_enabled=True``, the graph inserts a
+        decompose-check node before routing.  Multi-part questions
+        are split and run through the RAG pipeline in parallel.
 
     Args:
         search_tool:  SearchWikipediaTool or equivalent.
@@ -516,6 +651,8 @@ def build_supervisor_graph(
         timeline_tool:  Optional ``TimelineTool``.
         calculator_tool:  Optional ``CalculatorTool``.
         routing_mode:  ``"hybrid"`` | ``"heuristic_only"`` | ``"llm_only"``.
+        decomposer_enabled:  Enable/disable task decomposition.
+        decomposer_max_workers:  Max parallel sub-question threads.
 
     Returns:
         Compiled LangGraph ready for ``.invoke()`` and ``.stream()``.
@@ -553,6 +690,40 @@ def build_supervisor_graph(
     # --- Build supervisor StateGraph ----------------------------------
     builder: StateGraph = StateGraph(SupervisorState)
 
+    # ← NEW (Day 11): rewrite_query as the new entry point
+    builder.add_node(
+        "rewrite_query",
+        _make_rewrite_query_node(model, prompt_builder, generation_settings),
+    )
+
+    # ← NEW (Day 11): decompose_check after rewrite
+    builder.add_node(
+        "decompose_check",
+        make_decompose_node(
+            model=model,
+            prompt_builder=prompt_builder,
+            generation_settings=generation_settings,
+            enabled=decomposer_enabled,
+        ),
+    )
+
+    # ← NEW (Day 11): parallel retrieve + synthesise for decomposed questions
+    builder.add_node(
+        "parallel_retrieve",
+        make_parallel_retrieve_node(
+            rag_subgraph=rag_subgraph,
+            max_workers=decomposer_max_workers,
+        ),
+    )
+    builder.add_node(
+        "synthesise",
+        make_synthesise_node(
+            model=model,
+            prompt_builder=prompt_builder,
+            generation_settings=generation_settings,
+        ),
+    )
+
     builder.add_node(
         "route_question",
         _make_route_node(model, routing_mode, generation_settings),
@@ -585,8 +756,26 @@ def build_supervisor_graph(
     builder.add_node("merge", _make_merge_node())
 
     # --- Wire edges ---------------------------------------------------
-    builder.set_entry_point("route_question")
+    # ← CHANGED (Day 11): entry is now rewrite_query → decompose_check
+    builder.set_entry_point("rewrite_query")
+    builder.add_edge("rewrite_query", "decompose_check")
 
+    # ← NEW (Day 11): conditional split after decompose_check
+    decompose_dispatch_map: dict[str, str] = {
+        "parallel_retrieve": "parallel_retrieve",
+        "route_question": "route_question",
+    }
+    builder.add_conditional_edges(
+        "decompose_check",
+        decompose_dispatcher,
+        decompose_dispatch_map,
+    )
+
+    # Decomposed path → synthesise → merge
+    builder.add_edge("parallel_retrieve", "synthesise")
+    builder.add_edge("synthesise", "merge")
+
+    # Simple path → normal routing dispatch
     dispatch_map: dict[str, str] = {"run_local_rag": "run_local_rag"}
     if web_search_tool is not None:
         dispatch_map["run_web_research"] = "run_web_research"
@@ -626,6 +815,8 @@ def run_supervisor_graph(
     *,
     search_top_k: int | None = None,
     open_top_n: int | None = None,
+    chat_history: list[dict[str, str]] | None = None,  # ← NEW (Day 11)
+    conversation_summary: str | None = None,  # ← NEW (Day 11)
     run_type: str = "supervisor_graph",
     service_name: str = "agentic-workbench-supervisor-graph",
 ) -> SupervisorState:
@@ -638,6 +829,8 @@ def run_supervisor_graph(
         config_snapshot:  Frozen config dict for the run record.
         search_top_k:  Override the default search_top_k.
         open_top_n:  Override the default open_top_n.
+        chat_history:  Recent conversation turns for multi-turn chat.
+        conversation_summary:  Rolling summary of older conversation.
         run_type:  Run type label for the context.
         service_name:  Service name for tracing.
 
@@ -670,6 +863,11 @@ def run_supervisor_graph(
                 initial_state["search_top_k"] = search_top_k
             if open_top_n is not None:
                 initial_state["open_top_n"] = open_top_n
+            # ← NEW (Day 11): pass chat context
+            if chat_history is not None:
+                initial_state["chat_history"] = chat_history
+            if conversation_summary is not None:
+                initial_state["conversation_summary"] = conversation_summary
 
             result: SupervisorState = graph.invoke(initial_state)
 
@@ -680,31 +878,34 @@ def run_supervisor_graph(
             "supervisor_graph_completed",
             {
                 "question": question[:200],
-                "route": result.get("route", "unknown"),
-                "router_method": result.get("router_method", "unknown"),
-                "router_confidence": result.get("router_confidence", 0.0),
-                "router_rationale": result.get("router_rationale", ""),
-                "router_latency_ms": result.get("router_latency_ms", 0.0),
-                "subgraph_used": result.get("subgraph_used", "unknown"),
-                "answer_length": len(result.get("answer_text", "")),
-                "citation_count": len(result.get("citations", [])),
-                "web_citation_count": len(result.get("web_citations", [])),
-                "retrieved_count": len(result.get("retrieved", [])),
-                "opened_count": len(result.get("opened", [])),
-                "tokens_in": result.get("tokens_in", 0),
-                "tokens_out": result.get("tokens_out", 0),
+                "rewritten_query": (result.get("rewritten_query") or "")[:200],
+                "route": result.get("route") or "unknown",
+                "router_method": result.get("router_method") or "unknown",
+                "router_confidence": result.get("router_confidence") or 0.0,
+                "router_rationale": result.get("router_rationale") or "",
+                "router_latency_ms": result.get("router_latency_ms") or 0.0,
+                "subgraph_used": result.get("subgraph_used") or "unknown",
+                "is_decomposed": result.get("is_decomposed", False),
+                "sub_question_count": len(result.get("sub_questions") or []),
+                "answer_length": len(result.get("answer_text") or ""),
+                "citation_count": len(result.get("citations") or []),
+                "web_citation_count": len(result.get("web_citations") or []),
+                "retrieved_count": len(result.get("retrieved") or []),
+                "opened_count": len(result.get("opened") or []),
+                "tokens_in": result.get("tokens_in") or 0,
+                "tokens_out": result.get("tokens_out") or 0,
                 "error": result.get("error"),
                 "total_ms": round(total_ms, 1),
             },
         )
 
-        tokens_out = result.get("tokens_out", 0)
+        tokens_out = result.get("tokens_out") or 0
         if tokens_out > 0:
             logger.log_model_call(
                 model_name="local-model",
-                tokens_in=result.get("tokens_in", 0),
+                tokens_in=result.get("tokens_in") or 0,
                 tokens_out=tokens_out,
-                duration_ms=result.get("model_latency_ms", 0.0),
+                duration_ms=result.get("model_latency_ms") or 0.0,
             )
 
         # --- Record metrics -------------------------------------------
@@ -715,25 +916,32 @@ def run_supervisor_graph(
         )
         metrics.record_component_latency(
             component_name="supervisor_graph.router",
-            duration_ms=result.get("router_latency_ms", 0.0),
+            duration_ms=result.get("router_latency_ms") or 0.0,
             component_type="router",
         )
+        # ← NEW (Day 11): decomposer latency metric
+        if (result.get("decompose_latency_ms") or 0) > 0:
+            metrics.record_component_latency(
+                component_name="supervisor_graph.decomposer",
+                duration_ms=result.get("decompose_latency_ms") or 0.0,
+                component_type="decomposer",
+            )
 
         if tokens_out > 0:
             metrics.record_model_tokens(
                 model_name="local-model",
-                tokens_in=result.get("tokens_in", 0),
+                tokens_in=result.get("tokens_in") or 0,
                 tokens_out=tokens_out,
-                duration_ms=result.get("model_latency_ms", 0.0),
+                duration_ms=result.get("model_latency_ms") or 0.0,
             )
 
         if result.get("retrieved"):
             metrics.record_retrieval(
-                final_count=len(result.get("opened", [])),
+                final_count=len(result.get("opened") or []),
                 query=question,
-                keyword_candidates=len(result.get("retrieved", [])),
-                vector_candidates=len(result.get("retrieved", [])),
-                reranked=len(result.get("retrieved", [])),
+                keyword_candidates=len(result.get("retrieved") or []),
+                vector_candidates=len(result.get("retrieved") or []),
+                reranked=len(result.get("retrieved") or []),
                 duration_ms=total_ms,
             )
 

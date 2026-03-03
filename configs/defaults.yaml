@@ -72,6 +72,11 @@ source_fetch:
 supervisor:
   routing_mode: "hybrid"            # "hybrid" (default) | "heuristic_only" | "llm_only"
 
+# Task decomposition settings (Day 11)
+decomposer:
+  enabled: true                     # set false to skip decomposition entirely
+  max_workers: 4                    # max parallel sub-question threads
+
 # Data paths
 paths:
   data_dir: "./data"

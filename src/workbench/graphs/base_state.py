@@ -20,6 +20,8 @@ State schemas
 ``SupervisorState``
     Day 7: extends RAGState with routing metadata and
     subgraph result aggregation for the supervisor graph.
+    Day 11: adds task decomposition fields for multi-part
+    question handling.
 
 Both use ``total=False`` so callers only need to provide ``question``
 at invoke time — the rest is populated by graph nodes.
@@ -128,3 +130,9 @@ class SupervisorState(RAGState):
 
     # Subgraph provenance
     subgraph_used: str  # name of the subgraph that actually ran
+
+    # --- Task decomposition (Day 11) ---------------------------------
+    is_decomposed: bool  # True if question was split into sub-questions
+    sub_questions: list[str]  # extracted sub-questions (empty if not decomposed)
+    sub_results: list[dict[str, Any]]  # results from each sub-question retrieval
+    decompose_latency_ms: float  # time spent in the decompose node
